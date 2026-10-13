@@ -10,6 +10,7 @@ type RequestView interface {
 	InputTokens() int
 	PredictedOutputTokens() int // 0 if no prediction available
 	ArrivalTime() int64         // Virtual time in microseconds
+	Priority() int              // Priority band (0 = High/Default, 1 = Low)
 }
 
 // SchedulerView represents the read-only state of tenant queues exposed to the fairness policy.
@@ -76,11 +77,15 @@ func (t LiftTiming) String() string {
 type ChargingModel int
 
 const (
-	// ChargingIncremental charges input tokens at dispatch and output tokens step-by-step as generated.
+	// ChargingIncremental charges input tokens at dispatch and output tokens step-by-step as generated (VTC-native).
 	ChargingIncremental ChargingModel = iota
 
 	// ChargingCompletion charges the full request token cost (input + output) upon completion.
 	ChargingCompletion
+
+	// ChargingPredictedAtAdmission charges input + predicted output tokens upon admission,
+	// and corrects the counter on completion by delta = w_out * (totalOutput - predictedOutput).
+	ChargingPredictedAtAdmission
 )
 
 func (c ChargingModel) String() string {
@@ -89,6 +94,8 @@ func (c ChargingModel) String() string {
 		return "incremental"
 	case ChargingCompletion:
 		return "completion"
+	case ChargingPredictedAtAdmission:
+		return "predicted-at-admission"
 	default:
 		return "unknown"
 	}

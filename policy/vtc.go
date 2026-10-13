@@ -9,6 +9,7 @@ import (
 type VTCConfig struct {
 	InputWeight   float64
 	OutputWeight  float64
+	TenantWeights map[string]float64 // w_i per tenant (default: 1.0)
 	LiftMode      LiftMode
 	LiftTiming    LiftTiming
 	ChargingModel ChargingModel
@@ -20,6 +21,7 @@ func DefaultVTCConfig() VTCConfig {
 	return VTCConfig{
 		InputWeight:   1.0,
 		OutputWeight:  2.0,
+		TenantWeights: make(map[string]float64),
 		LiftMode:      LiftModeArtifact,
 		LiftTiming:    LiftTimingArrival,
 		ChargingModel: ChargingIncremental,
@@ -46,6 +48,9 @@ func NewVTC(cfg VTCConfig) *VTC {
 	if cfg.OutputWeight <= 0 {
 		cfg.OutputWeight = 2.0
 	}
+	if cfg.TenantWeights == nil {
+		cfg.TenantWeights = make(map[string]float64)
+	}
 	return &VTC{
 		config:      cfg,
 		counters:    make(map[string]float64),
@@ -61,6 +66,15 @@ func (p *VTC) Config() VTCConfig {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.config
+}
+
+func (p *VTC) tenantWeight(tenantID string) float64 {
+	if p.config.TenantWeights != nil {
+		if w, ok := p.config.TenantWeights[tenantID]; ok && w > 0 {
+			return w
+		}
+	}
+	return 1.0
 }
 
 // Counter returns a copy of the current counter for a tenant (for inspection & metrics).
@@ -190,9 +204,15 @@ func (p *VTC) OnDispatch(req RequestView) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	w := p.tenantWeight(req.TenantID())
 	if p.config.ChargingModel == ChargingIncremental {
 		// Prefill cost charged upon admission into execution
-		cost := p.config.InputWeight * float64(req.InputTokens())
+		cost := (p.config.InputWeight * float64(req.InputTokens())) / w
+		p.counters[req.TenantID()] += cost
+	} else if p.config.ChargingModel == ChargingPredictedAtAdmission {
+		// Input tokens + predicted output tokens charged at admission
+		cost := (p.config.InputWeight*float64(req.InputTokens()) +
+			p.config.OutputWeight*float64(req.PredictedOutputTokens())) / w
 		p.counters[req.TenantID()] += cost
 	}
 }
@@ -203,7 +223,7 @@ func (p *VTC) OnTokens(tenantID string, inputTokens, outputTokens int) {
 
 	if p.config.ChargingModel == ChargingIncremental {
 		// Output tokens charged incrementally per generation step
-		cost := p.config.OutputWeight * float64(outputTokens)
+		cost := (p.config.OutputWeight * float64(outputTokens)) / p.tenantWeight(tenantID)
 		p.counters[tenantID] += cost
 	}
 }
@@ -212,9 +232,19 @@ func (p *VTC) OnComplete(tenantID string, req RequestView, totalInput, totalOutp
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	w := p.tenantWeight(tenantID)
 	if p.config.ChargingModel == ChargingCompletion {
 		// Full request cost charged upon completion
-		cost := p.config.InputWeight*float64(totalInput) + p.config.OutputWeight*float64(totalOutput)
+		cost := (p.config.InputWeight*float64(totalInput) + p.config.OutputWeight*float64(totalOutput)) / w
 		p.counters[tenantID] += cost
+	} else if p.config.ChargingModel == ChargingPredictedAtAdmission {
+		// Correct for difference between actual output and predicted output:
+		predOut := 0
+		if req != nil {
+			predOut = req.PredictedOutputTokens()
+		}
+		diff := totalOutput - predOut
+		delta := (p.config.OutputWeight * float64(diff)) / w
+		p.counters[tenantID] += delta
 	}
 }

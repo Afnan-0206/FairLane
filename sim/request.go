@@ -11,6 +11,7 @@ type Request struct {
 	inputTokens int
 	actualOut   int
 	predOut     int
+	priority    int // Priority band (0 = High/Default, 1 = Low)
 	arrivalUs   int64
 
 	// Simulation tracking state
@@ -28,8 +29,20 @@ func NewRequest(id, tenantID string, inputTokens, actualOut, predOut int, arriva
 		inputTokens: inputTokens,
 		actualOut:   actualOut,
 		predOut:     predOut,
+		priority:    0,
 		arrivalUs:   arrivalUs,
 	}
+}
+
+// WithPriority sets the priority band for the request (fluent builder).
+func (r *Request) WithPriority(p int) *Request {
+	r.priority = p
+	return r
+}
+
+// SetPredictedOutput sets the predicted output tokens.
+func (r *Request) SetPredictedOutput(p int) {
+	r.predOut = p
 }
 
 // policy.RequestView implementation:
@@ -38,6 +51,7 @@ func (r *Request) TenantID() string              { return r.tenantID }
 func (r *Request) InputTokens() int              { return r.inputTokens }
 func (r *Request) PredictedOutputTokens() int     { return r.predOut }
 func (r *Request) ArrivalTime() int64            { return r.arrivalUs }
+func (r *Request) Priority() int                 { return r.priority }
 
 // Simulation-internal getters (never accessed by policy):
 func (r *Request) ActualOutputTokens() int { return r.actualOut }
