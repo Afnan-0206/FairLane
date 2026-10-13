@@ -9,16 +9,16 @@
 # Service metrics are evaluated strictly within the measurement window where BOTH tenants are backlogged.
 #
 # Pre-committed Hypotheses:
-# 1. Round-Robin Hand-Calc Prediction: Under strict 1:1 request dispatch (N_chat = N_rag),
+# 1. Round-Robin Hand-Calc Prediction [Pre-registered]: Under strict 1:1 request dispatch (N_chat = N_rag),
 #    Chat weighted token share is 256 / (256 + 4256) = 256 / 4512 ~ 5.67% (~5.7%).
 #    Raw token share is 192 / (192 + 4128) = 192 / 4320 ~ 4.44%.
-#    Under continuous batching, if KV capacity restricts concurrent RAG admissions, Chat may capture
-#    additional batch slots, elevating empirical share above 5.7%.
-# 2. VTC Hand-Calc Prediction: By balancing virtual token counters (c_chat ~ c_rag),
+#    [Pilot-Informed Hedge]: Under continuous batching, if KV capacity or cursor bypass restricts
+#    concurrent RAG admissions, Chat may capture additional batch slots, elevating empirical share above 5.7%.
+# 2. VTC Hand-Calc Prediction [Pre-registered]: By balancing virtual token counters (c_chat ~ c_rag),
 #    VTC will schedule ~16.6 Chat requests for every 1 RAG request, targeting:
 #    Chat Weighted Token Share ~ 50.0% (+/- 5%) and RAG Weighted Token Share ~ 50.0% (+/- 5%).
 #    Chat Raw Token Share ~ (16.625 * 192) / (16.625 * 192 + 4128) = 3192 / 7320 ~ 43.6%.
-# 3. FIFO Prediction: Earliest arrivals monopolize continuous batch slots, leaving Chat with <5% token share.
+# 3. FIFO Prediction [Pre-registered]: Earliest arrivals monopolize continuous batch slots, leaving Chat with <5% token share.
 
 experiment_name: "exp_heterogeneous_steady_state"
 seeds_count: 30
@@ -37,7 +37,7 @@ server:
 workload:
   tenants:
     - tenant_id: "chat"
-      request_count: 2500
+      request_count: 4000 # 80s of arrivals (past 60s horizon)
       arrival_process: "poisson"
       mean_interval_us: 20000 # 50 req/s
       prompt_length_min: 128
@@ -46,7 +46,7 @@ workload:
       output_length_max: 64
 
     - tenant_id: "rag"
-      request_count: 500
+      request_count: 800 # 80s of arrivals (past 60s horizon)
       arrival_process: "poisson"
       mean_interval_us: 100000 # 10 req/s
       prompt_length_min: 4000

@@ -178,7 +178,7 @@ func main() {
 
 	chatCfg := sim.TenantWorkloadConfig{
 		TenantID:        "chat",
-		RequestCount:    2500,
+		RequestCount:    4000,  // 80s of arrivals (past 60s horizon)
 		ArrivalProcess:  "poisson",
 		MeanIntervalUs:  20000, // 50 req/s -> heavy backlog
 		PromptLengthMin: 128,
@@ -189,7 +189,7 @@ func main() {
 
 	ragCfg := sim.TenantWorkloadConfig{
 		TenantID:        "rag",
-		RequestCount:    500,
+		RequestCount:    800,    // 80s of arrivals (past 60s horizon)
 		ArrivalProcess:  "poisson",
 		MeanIntervalUs:  100000, // 10 req/s -> heavy backlog
 		PromptLengthMin: 4000,
@@ -203,8 +203,8 @@ func main() {
 		fn   func() policy.Policy
 	}{
 		{"fifo", func() policy.Policy { return policy.NewFIFO() }},
-		{"round-robin (onPick)", func() policy.Policy { return policy.NewRoundRobinWithAdvance(policy.RRAdvanceOnPick) }},
-		{"round-robin (onDispatch)", func() policy.Policy { return policy.NewRoundRobinWithAdvance(policy.RRAdvanceOnDispatch) }},
+		{"round-robin-upstream", func() policy.Policy { return policy.NewRoundRobinWithAdvance(policy.RRAdvanceUpstream) }},
+		{"round-robin-idealized", func() policy.Policy { return policy.NewRoundRobinWithAdvance(policy.RRAdvanceIdealized) }},
 		{"vtc", func() policy.Policy { return policy.NewVTC(policy.DefaultVTCConfig()) }},
 	}
 
@@ -454,10 +454,10 @@ func main() {
 		case "fifo":
 			predWtd = "~22.8% (arr mix)"
 			predRaw = "~18.9% (arr mix)"
-		case "round-robin (onDispatch)":
+		case "round-robin-idealized":
 			predWtd = "~5.7% (1:1 req)"
 			predRaw = "~4.4% (1:1 req)"
-		case "round-robin (onPick)":
+		case "round-robin-upstream":
 			predWtd = "~30%-35% (bypass)"
 			predRaw = "~25%-30% (bypass)"
 		case "vtc":
