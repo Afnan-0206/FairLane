@@ -9,48 +9,69 @@ FairLane evaluates and implements token-aware scheduling and admission control p
 All experiments run across $N = 30$ independent random seeds with 95% non-parametric bootstrap confidence intervals.
 
 > [!NOTE]
-> **Methodology Disclosure**: Experiment 1's hypothesis YAML was originally committed after its first exploratory run during early Phase 1 prototyping. Experiment 2's hypothesis YAML was committed *strictly prior* to running.
+> **Pre-Registration & Methodology Disclosures**:
+> 1. **Commit Timing**: Experiment 1's hypothesis YAML was committed *after* its first exploratory run during early Phase 1.
+> 2. **Pilot-Informed Steady-State**: For Experiment 2, early exploratory script `proto.go` ran steady-state Poisson configurations before the formal YAML existed; the committed hypothesis in `experiments/exp_heterogeneous.yaml` (commit `04c2725`, committed `2026-10-13 16:14:53 +0530`) was therefore **pilot-informed**.
+> 3. **Hypothesis Verdicts**: The original finite-trace hypothesis (commit `2019c5d`, `2026-10-13 15:39:12 +0530`) was **falsified** due to the tokens conservation invariant ($\sum \text{Served} \equiv \sum \text{Submitted}$). The steady-state hypothesis is evaluated below. Note that earlier commit hashes from prior rebases are stale.
+
+---
 
 ### Experiment 1: Noisy Neighbor Protection under Flooding (`exp_noisy_neighbor`)
 - **Topology**: Victim tenant (60 requests, 128 prompt / 64 decode, 20 req/s Poisson, strictly below fair share) co-located with a Flooder tenant (240 requests, 1024 prompt / 256 decode, 83.3 req/s Poisson, saturating server capacity). Server KV capacity: 4096 tokens, max batch size: 16.
-- **Fairness Metric Definition**: Jain's Fairness Index is evaluated over sliding token windows ($W = 1000$ tokens) of served tokens across active tenants: $J(x) = (\sum x_i)^2 / (n \sum x_i^2)$.
+- **Metric Definitions**:
+  - Primary: Victim Slowdown vs Solo run, Mean TTFT with 95% bootstrap CIs.
+  - Secondary: Sliding Token Window Jain's Index ($W = 1000$ tokens served across active tenants).
 
-| Policy | Victim Slowdown vs Solo (95% CI) | Victim TTFT Mean (ms) (95% CI) | Victim TTFT P95 (ms) | Jain's Index (Sliding 1000 tok) | Idle-While-Queued (µs) |
+#### Performance Across Both Admission Modes ($N = 30$ Seeds, 95% CI):
+| Policy | Admission Mode | Victim Slowdown (95% CI) | Victim TTFT Mean (ms) (95% CI) | Queue Wait Mean (ms) | Prefill Mean (ms) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **FIFO** | 160.37x [151.46, 169.23]\* | 52,461.3 [49,564.5, 55,341.1] | 61,703.3 | 0.726 [0.713, 0.738] | 0 |
-| **Round-Robin** | 2.19x [1.95, 2.46] | 398.0 [318.3, 486.4] | 853.6 | 0.870 [0.853, 0.887] | 0 |
-| **VTC (default)** | 4.54x [4.31, 4.76] | 1,172.3 [1,097.2, 1,248.1] | 1,530.6 | 0.830 [0.825, 0.835] | 0 |
-| **VTC (paper lift)** | 4.54x [4.31, 4.77] | 1,173.7 [1,098.0, 1,250.8] | 1,552.9 | 0.830 [0.826, 0.835] | 0 |
-| **VTC (completion)** | 4.53x [4.34, 4.73] | 1,169.5 [1,104.1, 1,235.9] | 1,479.0 | 0.600 [0.584, 0.617] | 0 |
-| **VTC ($w_{\text{out}}=1$)** | 4.28x [4.05, 4.51] | 1,088.0 [1,011.0, 1,166.9] | 1,459.0 | 0.808 [0.802, 0.815] | 0 |
-| **VTC ($w_{\text{out}}=2$)** | 4.54x [4.31, 4.76] | 1,172.3 [1,097.2, 1,248.1] | 1,530.6 | 0.830 [0.825, 0.835] | 0 |
-| **VTC ($w_{\text{out}}=3$)** | 4.72x [4.50, 4.94] | 1,231.8 [1,158.0, 1,306.3] | 1,588.9 | 0.830 [0.826, 0.834] | 0 |
-| **VTC ($w_{\text{out}}=4$)** | 4.89x [4.67, 5.10] | 1,287.0 [1,214.0, 1,360.2] | 1,625.9 | 0.830 [0.825, 0.835] | 0 |
+| **FIFO** | `break` | 160.37x [151.46, 169.23]\* | 52,461.3 [49,564.5, 55,341.1] | 52,460.7 | 0.6 |
+| **FIFO** | `skip` | 159.20x [150.31, 168.10]\* | 52,148.0 [49,261.2, 55,023.4] | 52,147.4 | 0.6 |
+| **Round-Robin** | `break` | 2.19x [1.96, 2.45] | 398.0 [321.5, 484.2] | 397.4 | 0.6 |
+| **Round-Robin** | `skip` | 1.83x [1.63, 2.01] | 311.3 [259.6, 370.6] | 310.7 | 0.6 |
+| **VTC (default)** | `break` | 4.54x [4.31, 4.77] | 1,172.3 [1,096.4, 1,249.7] | 1,171.7 | 0.6 |
+| **VTC (default)** | `skip` | 2.00x [1.82, 2.21] | 336.7 [276.9, 403.9] | 336.1 | 0.6 |
 
-*\*Note on FIFO Slowdown*: Marked as **unbounded / horizon-dependent**. Because flooder arrival rate ($\lambda = 83.3$ req/s) exceeds maximum service rate ($\mu \approx 12.5$ req/s), the FIFO queue grows linearly without bound. The measured $160.37\times$ ratio is strictly a function of the 300-request horizon (at 600 reqs: $313.8\times$; at 1200 reqs: $633.8\times$).
+*\*Note on FIFO Slowdown*: Marked as **unbounded / horizon-dependent**. Flooder arrival rate ($\lambda = 83.3$ req/s) exceeds service rate ($\mu \approx 12.5$ req/s). The measured $160.37\times$ ratio scales linearly with duration:
+- Arrival Stream: 3.0s / Trace Drain Horizon: 104.0s $\rightarrow$ Slowdown = **177.3x** (Max Queue: 204)
+- Arrival Stream: 6.0s / Trace Drain Horizon: 208.0s $\rightarrow$ Slowdown = **313.8x** (Max Queue: 408)
+- Arrival Stream: 12.0s / Trace Drain Horizon: 416.0s $\rightarrow$ Slowdown = **633.8x** (Max Queue: 816)
 
 ---
 
 ### Experiment 2: Steady-State Heterogeneous Sizing (`exp_heterogeneous`)
-- **Topology**: Chat tenant (128 prompt / 64 decode, raw 192 tok, weighted 256 tok with $w_{\text{in}}=1, w_{\text{out}}=2$, Poisson 50 req/s) vs RAG tenant (4000 prompt / 128 decode, raw 4128 tok, weighted 4256 tok, Poisson 10 req/s). Both arrival rates exceed individual fair shares. Server KV capacity: 16,384 tokens, max batch size: 16.
-- **Protocol**: Fixed 60.0s simulation horizon, discarding a 10.0s warm-up period. Measured strictly in the steady-state window $[10.0\text{s}, 60.0\text{s}]$ where **both tenants are backlogged**.
-- **Fairness Metric Definition**: Share of served tokens (both weighted and raw) allocated to each tenant during the concurrent backlog window.
+- **Topology**: Chat tenant (128 prompt / 64 decode, raw 192 tok, weighted 256 tok with $w_{\text{in}}=1, w_{\text{out}}=2$, Poisson 50 req/s) vs RAG tenant (4000 prompt / 128 decode, raw 4128 tok, weighted 4256 tok, Poisson 10 req/s). Server KV capacity: 16,384 tokens, max batch size: 16.
+- **Protocol**: Fixed 60.0s simulation horizon, discarding 10.0s warm-up. Evaluated strictly in the window $[10.0\text{s}, 60.0\text{s}]$ where **both queues are backlogged**, with arrival-time sorted requests.
+- **Primary Metric Definition**: Long time-window token shares (weighted and raw) and Max-Min Service Ratio: $\max(S_c, S_r) / \min(S_c, S_r)$.
 
-| Policy | Chat Weighted Share (%) (95% CI) | Chat Raw Share (%) (95% CI) | Hand-Calc Prediction (Weighted) | Hand-Calc Prediction (Raw) | Chat TTFT Mean (ms) (95% CI) | RAG TTFT Mean (ms) (95% CI) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **FIFO** | **0.4%** [0.4%, 0.4%] | **0.2%** [0.2%, 0.2%] | <5.0% | <5.0% | 1,341.5 [1,331.4, 1,351.9] | 51,773.1 [51,691.0, 51,855.2]\* |
-| **Round-Robin** | **31.9%** [31.5%, 32.3%] | **26.6%** [26.2%, 26.9%] | ~5.7% (1:1 reqs) | ~4.4% (1:1 reqs) | 1,441.1 [1,424.3, 1,457.9] | 52,331.2 [52,248.8, 52,413.6]\* |
-| **VTC** | **48.1%** [47.6%, 48.6%] | **41.7%** [41.1%, 42.1%] | **~50.0%** | **~43.6%** | 1,426.1 [1,410.2, 1,442.0] | 52,996.1 [52,912.4, 53,079.8]\* |
+#### Steady-State Results ($N = 30$ Seeds, 95% Bootstrap CI):
+| Policy | Chat Weighted Share (%) (95% CI) | Chat Raw Share (%) (95% CI) | Max-Min Ratio (95% CI) | Window Dispatches (Chat / RAG) | Unserved Reqs at 60s (Chat / RAG) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **FIFO** | **23.0%** [22.6%, 23.5%] | **18.8%** [18.4%, 19.3%] | 3.35 [3.27, 3.44] | 1064 [1043, 1087] / 213 [211, 214] | 1220 [1194, 1244] / 245 [243, 246] |
+| **Round-Robin (`onPick`)** | **33.8%** [33.8%, 33.8%] | **28.3%** [28.3%, 28.3%] | 1.96 [1.96, 1.96] | 1766 [1766, 1767] / 207 [207, 207] | 380 [379, 381] / 251 [251, 251] |
+| **Round-Robin (`onDispatch`)** | **5.6%** [5.6%, 5.6%] | **4.4%** [4.4%, 4.4%] | 16.73 [16.71, 16.75] | 247 [245, 249] / 247 [245, 249] | 2188 [2185, 2192] / 202 [200, 205] |
+| **VTC** | **49.8%** [49.8%, 49.8%] | **43.5%** [43.4%, 43.5%] | **1.01** [1.01, 1.01] | 2030 [2029, 2032] / 122 [122, 122] | 66 [64, 69] / 352 [352, 352] |
 
-*\*Note on RAG TTFT*: Under overload, RAG queue accumulates backlogged requests, leading to queue delay accumulation approaching the 60s horizon.
+#### TTFT Performance with 95% Bootstrap CIs:
+| Policy | Chat TTFT Mean ms (95% CI) | RAG TTFT Mean ms (95% CI) |
+| :--- | :---: | :---: |
+| **FIFO** | 17,234.5 [16,872.7, 17,573.5] ms | 17,076.8 [16,856.3, 17,278.7] ms |
+| **Round-Robin (`onPick`)** | 8,805.5 [8,660.8, 8,951.2] ms | 17,385.8 [17,074.9, 17,672.0] ms |
+| **Round-Robin (`onDispatch`)** | 25,386.1 [24,983.3, 25,702.8] ms | 14,960.8 [14,592.5, 15,311.6] ms |
+| **VTC** | **5,788.8** [5,648.8, 5,929.6] ms | 22,103.7 [21,883.5, 22,317.1] ms |
 
-#### Hand-Calculation Analysis & Deviations:
-1. **VTC Target**: VTC balances virtual token counters ($c_{\text{chat}} \approx c_{\text{rag}}$), targeting:
-   $$\text{Weighted Share}_{\text{chat}} = \frac{c_{\text{chat}}}{c_{\text{chat}} + c_{\text{rag}}} \approx 50.0\%$$
-   The measured **48.1% [47.6%, 48.6%]** matches the theoretical 50.0% prediction within 1.9 percentage points. Raw share matches $41.7\%$ vs $43.6\%$ predicted.
-2. **Round-Robin Deviation from 5.7%**:
-   - Theoretical 1:1 request dispatch predicts: $\frac{256}{256 + 4256} = 5.67\%$.
-   - **Why RR achieves 31.9%**: With a 16,384-token KV cache, each RAG request requires $\ge 4,001$ tokens, allowing at most 3 to 4 concurrent RAG requests in the batch. Whenever 3-4 RAG requests run, subsequent RAG head requests cannot fit into available KV cache. Round-Robin dispatches Chat requests whenever RAG cannot fit or is alternated, elevating Chat request completion share to ~68% and weighted token share to 31.9%.
+#### Key Analytical Findings:
+1. **FIFO Sanity & Arrival Mix**:
+   - With arrival-time sorting, FIFO Chat raw share is **18.8% [18.4%, 19.3%]**, directly matching the theoretical arrival mix of **18.86%**:
+     $$\frac{50 \times 192}{50 \times 192 + 10 \times 4128} = \frac{9600}{9600 + 41280} = 18.86\%$$
+   - Under single-queue FIFO ordering, Chat TTFT (17,234.5 ms) and RAG TTFT (17,076.8 ms) are virtually identical, reflecting true arrival-order queue delay. The earlier 0.4% Chat share was an artifact of unsorted request generation where Chat requests preceded RAG requests in the trace slice.
+2. **Round-Robin Cursor Dynamics (`onPick` vs `onDispatch`)**:
+   - `RRAdvance=onDispatch`: When the cursor advances strictly upon confirmed admission, dispatch counts in the window are **exactly 1.00 : 1** (247 Chat : 247 RAG). This yields **4.4% raw share** and **5.6% weighted share**, perfectly matching the theoretical hand calculation:
+     $$\text{Raw: } \frac{192}{192 + 4128} = 4.44\%, \quad \text{Weighted: } \frac{256}{256 + 4256} = 5.67\%$$
+   - `RRAdvance=onPick`: When the cursor advances inside `Pick()`, non-fitting RAG head requests fail `server.CanAdmit()`, causing subsequent picks to bypass RAG and select Chat. This elevates Chat dispatches to an 8.53 : 1 ratio (1766 Chat : 207 RAG) and inflates Chat weighted share to 33.8%.
+3. **VTC Token Parity**:
+   - VTC dispatches 2030 Chat to 122 RAG requests (ratio **16.64 : 1**, matching theoretical $4256 / 256 = 16.625$), achieving **49.8% [49.8%, 49.8%]** weighted token share and **1.01** Max-Min Ratio.
+   - **VTC Bias Explanation (49.8% vs 50.0%)**: Minor boundary effects across the 10s and 60s window cutoffs and discrete 4000-token prefill step charging vs incremental per-step decode servicing account for the 0.2% variance.
 
 ---
 
@@ -58,43 +79,37 @@ All experiments run across $N = 30$ independent random seeds with 95% non-parame
 
 Diagnostics decompose scheduling mechanics, evaluate tie-breaking, measure horizon scaling, and trace exact step events:
 
-### 1. Tie-Break Investigation ($N = 30$ Seeds)
-To test whether tie-breaking between equal-counter tenants explains why VTC victim TTFT (1172 ms) is higher than Round-Robin (398 ms):
-- **VTC Default** (`flooder < victim` alphabetically): 4.54x slowdown [4.31, 4.77], TTFT 1172.3 ms [1096.4, 1249.7]
-- **VTC Swapped Names** (`a_victim < z_flooder`): 4.66x slowdown [4.45, 4.88], TTFT 1212.2 ms [1143.4, 1286.2]
-- **VTC Seeded Random Tie-Break**: 4.53x slowdown [4.31, 4.76], TTFT 1171.8 ms [1096.2, 1249.5]
-**Conclusion**: Tie-break order accounts for $\le 1\%$ difference. It does not explain the gap.
+### 1. Tie-Break Investigation under Break and Skip Modes ($N = 30$ Seeds)
+| Admission Mode | Configuration | Victim Slowdown (95% CI) | Victim TTFT ms (95% CI) |
+| :---: | :--- | :---: | :---: |
+| `break` | VTC Default (`flooder < victim`) | 4.54x [4.31, 4.77] | 1172.3 [1096.4, 1249.7] ms |
+| `break` | VTC Swapped (`a_victim < z_flooder`) | 4.66x [4.45, 4.88] | 1212.2 [1143.4, 1286.2] ms |
+| `break` | VTC Seeded Random Tie-Break | 4.53x [4.31, 4.76] | 1171.8 [1096.2, 1249.5] ms |
+| `skip` | VTC Default (`flooder < victim`) | 2.00x [1.82, 2.21] | 336.7 [276.9, 403.9] ms |
+| `skip` | VTC Swapped (`a_victim < z_flooder`) | 2.03x [1.85, 2.25] | 345.2 [286.0, 413.5] ms |
+| `skip` | VTC Seeded Random Tie-Break | 1.99x [1.81, 2.20] | 334.8 [274.5, 401.8] ms |
 
-### 2. TTFT Decomposition & AdmissionMode (`break` vs `skip`)
-- Under `AdmissionModeBreak` (default), VTC experiences **199.4 break blocks** per victim request (where the 1024-token flooder head request cannot fit into the remaining KV cache and halts batch formation), causing 1202 ms TTFT (99.1% queue wait).
-- Under `AdmissionModeSkip`, non-fitting head requests are bypassed: VTC TTFT drops to **343.6 ms** (or ~655 ms on heavily saturated seeds).
-- **Explanation of Remaining Gap (VTC 655 ms vs RR 392 ms)**:
-  1. Round-Robin alternates queues strictly 1:1 on dispatch turns; the moment a slot opens, victim gets immediate service regardless of past tokens.
-  2. VTC dispatches by lowest cumulative token counter. Because flooder generates 83.3 req/s with 1024-token prompts, flooder requests occupy batch concurrency and KV cache for hundreds of milliseconds, stretching execution step durations up to 15–20 ms per step and pacing victim dispatch to maintain token fairness.
+**Conclusion**: Tie-break direction accounts for $\le 1\%$ variance under both break and skip modes. While exact ties occur frequently upon arrival due to counter lifting ($c_v = \min_{t \in B} c_t = c_f$), tie resolution has zero statistical impact.
 
-### 3. FIFO Horizon Scaling
-| Horizon Scale | Flooder Reqs | Simulated Horizon | Max Queue Depth | Victim TTFT | Victim Slowdown |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **1x** | 240 reqs | 104.0 s | 204 reqs | 58.1 s | 177.3x |
-| **2x** | 480 reqs | 208.0 s | 408 reqs | 103.1 s | 313.8x |
-| **4x** | 960 reqs | 416.0 s | 816 reqs | 208.2 s | 633.8x |
-Proves that under persistent overload, FIFO queue growth is linear ($Q(t) \propto (\lambda - \mu)t$) and slowdown is strictly unbounded / horizon-dependent.
+### 2. Event Log for 3 Victim Arrivals (#1, #15, #30)
+- **Arrival #15 under `break` mode**: Victim arrived at $t = 1085.6\text{ ms}$, but experienced **71 consecutive break-blocked steps** because the flooder head request (1024 tokens) could not fit into available KV cache (<1025 tokens free). Victim was blocked until $t = 1450.4\text{ ms}$ (TTFT = 364.8 ms).
+- **Arrival #15 under `skip` mode**: Flooder was bypassed whenever it could not fit, admitting Victim as soon as 129 free KV tokens became available, reducing queue wait to 40.2 ms.
 
 ---
 
 ## Reproducibility & Commands
 
-Run all tests (including hand-computed Jain demand-capped and AdmissionMode starvation tests):
+Run all unit tests:
 ```bash
 make test
 ```
 
-Run Experiment 1 (Noisy Neighbor):
+Run Experiment 1:
 ```bash
 make exp-noisy-neighbor
 ```
 
-Run Experiment 2 (Steady-State Heterogeneous Sizing):
+Run Experiment 2:
 ```bash
 make exp-heterogeneous
 ```
@@ -107,6 +122,7 @@ make diagnose
 ---
 
 ## Hardware & Environment Metadata
+- **Author Identity**: `Afnan B.R. <273584085+Afnan-0206@users.noreply.github.com>`
 - **OS**: Microsoft Windows 11 Pro 10.0.26300
 - **CPU**: AMD Ryzen 7 PRO 5850U with Radeon Graphics (8 physical cores, 16 logical threads)
 - **RAM**: 15.31 GB

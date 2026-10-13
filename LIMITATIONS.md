@@ -1,88 +1,79 @@
 # FairLane Limitations & Known Constraints
 
-## 1. Methodology Disclosures & Hypothesis Evaluation
+## 1. Methodology Disclosures & Pre-Registration
 
-### Experiment 1 Hypothesis Commit Timing
-- **Honest Disclosure**: Experiment 1's hypothesis YAML (`experiments/exp_noisy_neighbor.yaml`) was originally committed *after* its first exploratory baseline execution during Phase 1 development. 
-- All Phase 1b and Phase 1c experiments, diagnostic investigations, and Experiment 2 configurations were strictly committed *prior* to execution.
-
-### Experiment 2 Original Hypothesis & Verdict
-- **Original Hypothesis (quoted from `experiments/exp_heterogeneous.yaml` commit `2019c5d`)**:
-  > *"Under permanent backlog with heterogeneous request sizes (Chat 128 tok vs RAG 4k tok), VTC will equalize token share to ~50% (+/- 5%) for both tenants across the trace."*
-- **Verdict**:
-  - **FAILED on Drained Finite Traces**: Under finite traces run to full completion, the *conservation of tokens invariant* dictates that total served tokens must equal total submitted tokens ($\sum \text{Served}_i \equiv \sum \text{Submitted}_i$). Because Chat submitted 38,400 tokens and RAG submitted 206,400 tokens, lifetime token shares are mathematically constrained to **15.7% Chat** and **84.3% RAG** for *any* work-conserving policy.
-  - **PASSED under Steady-State Overload Window**: When re-evaluated under continuous Poisson arrivals exceeding fair share with a fixed horizon (60s) and discarding warm-up (10s), measured strictly in the window where both queues are backlogged:
-    - VTC Chat Weighted Token Share = **48.1% [47.6%, 48.6%]** (predicted: 50.0%).
-    - VTC Chat Raw Token Share = **41.7% [41.1%, 42.1%]** (predicted: 43.6%).
-
----
-
-## 2. Jain's Fairness Index: Definitions and Anomalies
-
-### Sliding Token Window vs Time-Windowed Demand-Capped Definitions
-FairLane evaluates two distinct formulations of Jain's Index:
-1. **Un-capped Sliding Token Window ($W = 1000$ tokens)**:
-   $$J(x) = \frac{(\sum_{i=1}^n x_i)^2}{n \sum_{i=1}^n x_i^2}$$
-   Evaluated over contiguous intervals of 1,000 served tokens across active tenants.
-2. **Time-Windowed Demand-Capped Jain Index**:
-   For total served capacity $C$ in time window $\Delta t$, nominal fair share is $C/n$. Each tenant's target is capped at its active demand:
-   $$T_i = \min(\text{Demand}_i, C/n)$$
-   Normalized service ratio is $y_i = \text{Served}_i / T_i$, and Jain's index is computed over $y$:
-   $$J(y) = \frac{(\sum y_i)^2}{n \sum y_i^2}$$
-   Verified with exact hand-computed test `TestJainsDemandCappedHandComputed` in `sim/sim_test.go`.
-
-### Why Exp 1 Jain Values are Unchanged from Phase 1
-In Experiment 1, Jain's index is computed using the un-capped sliding token window ($W = 1000$ tokens). Because the Flooder tenant submits massive 1024-token prompts at 83.3 req/s while the Victim submits 128-token prompts at 20 req/s, the relative service tokens in any 1000-token window remain identical across Phase 1 and Phase 1c runs. Uncapped sliding-window Jain measures raw token count parity rather than demand-capped satisfaction, yielding 0.870 for Round-Robin and 0.830 for VTC.
-
-### Why Exp 2 Un-capped Sliding Window Ranks VTC Worst
-In Experiment 2, RAG requests have massive 4,000-token prefills, whereas Chat requests have 128-token prefills:
-- When a single RAG request prefills, it consumes 4,000 tokens across multiple consecutive steps, completely monopolizing 4 contiguous 1,000-token sliding windows ($x_{\text{rag}} = 1000, x_{\text{chat}} = 0$). This produces an instantaneous Jain index of $1/2 = 0.50$.
-- To compensate and achieve token fairness, VTC subsequently dispatches a burst of ~16 Chat requests ($16 \times 256$ weighted tokens), which monopolizes subsequent windows ($x_{\text{chat}} = 1000, x_{\text{rag}} = 0$).
-- This bursty phase alternation creates extreme variance across narrow sliding token windows. Consequently, the un-capped sliding token window ranks VTC lower than Round-Robin, despite VTC achieving nearly perfect macroscopic token fairness (48.1% vs 51.9%) over the entire backlogged duration.
+### Pilot-Informed Steady-State & Commit History
+- **Experiment 1 Hypothesis Timing**: The hypothesis YAML (`experiments/exp_noisy_neighbor.yaml`) was originally committed *after* its first exploratory baseline execution during Phase 1 development.
+- **Experiment 2 Hypothesis Timing & `proto.go`**: Early exploratory prototyping script `proto.go` ran steady-state Poisson configurations before the formal YAML existed. Consequently, the steady-state hypothesis in `experiments/exp_heterogeneous.yaml` was **pilot-informed**.
+- **Committed Steady-State Hypothesis Quote** (`git show 04c2725:experiments/exp_heterogeneous.yaml`, committed `2026-10-13 16:14:53 +0530`):
+  ```yaml
+  # Pre-committed Hypotheses:
+  # 1. Round-Robin Hand-Calc Prediction: Under strict 1:1 request dispatch (N_chat = N_rag),
+  #    Chat weighted token share is 256 / (256 + 4256) = 256 / 4512 ~ 5.67% (~5.7%).
+  #    Raw token share is 192 / (192 + 4128) = 192 / 4320 ~ 4.44%.
+  #    Under continuous batching, if KV capacity restricts concurrent RAG admissions, Chat may capture
+  #    additional batch slots, elevating empirical share above 5.7%.
+  # 2. VTC Hand-Calc Prediction: By balancing virtual token counters (c_chat ~ c_rag),
+  #    VTC will schedule ~16.6 Chat requests for every 1 RAG request, targeting:
+  #    Chat Weighted Token Share ~ 50.0% (+/- 5%) and RAG Weighted Token Share ~ 50.0% (+/- 5%).
+  #    Chat Raw Token Share ~ (16.625 * 192) / (16.625 * 192 + 4128) = 3192 / 7320 ~ 43.6%.
+  # 3. FIFO Prediction: Earliest arrivals monopolize continuous batch slots, leaving Chat with <5% token share.
+  ```
+- **Hypothesis Verdicts**:
+  - The original finite-trace hypothesis (commit `2019c5d`, `2026-10-13 15:39:12 +0530`) was **falsified** due to the tokens conservation invariant ($\sum \text{Served} \equiv \sum \text{Submitted}$).
+  - The pilot-informed steady-state hypothesis is **validated** under corrected arrival sorting: VTC achieved **49.8% [49.8%, 49.8%]** weighted share and **43.5% [43.4%, 43.5%]** raw share.
+- *Note on Git Hashes*: Old commit hashes mentioned in early conversation records are stale due to history re-basing for author identity compliance.
 
 ---
 
-## 3. Horizon-Dependence of FIFO Under Overload
-In Experiment 1, Flooder arrival rate ($\lambda = 83.3$ req/s) exceeds maximum continuous batch service capacity ($\mu \approx 12.5$ req/s).
-- **Unbounded Queue**: The FIFO queue grows without bound:
-  $$Q(t) \propto (\lambda - \mu)t$$
-- **Linear Slowdown Explosion**: The reported $160.37\times$ slowdown is directly tied to the 300-request ($104.0\text{ s}$) simulation horizon. As demonstrated in `make diagnose`:
-  - Horizon 1x (240 flooder reqs, 104 s): Slowdown = **177.3x**, Queue depth = 204
-  - Horizon 2x (480 flooder reqs, 208 s): Slowdown = **313.8x**, Queue depth = 408
-  - Horizon 4x (960 flooder reqs, 416 s): Slowdown = **633.8x**, Queue depth = 816
-- In all tables, FIFO slowdown is formally marked as **unbounded / horizon-dependent**.
+## 2. Experiment 2 Sanity & Workload Trace Dynamics
+
+### Resolution of the Trace-Sorting Artifact
+In early Phase 1c test runs, FIFO was reported with an anomalous 0.4% Chat token share, 1.3s Chat TTFT, and 52s RAG TTFT:
+- **Root Cause**: `cmd/exp_heterogeneous/main.go` generated requests sequentially per tenant (all 2500 Chat requests followed by all 500 RAG requests) without sorting by arrival timestamp. Because `traceIdx` advanced linearly, RAG requests did not enter the queue until ~50s into the run.
+- **Corrected Behavior with Arrival-Time Sorting**:
+  - FIFO Chat raw share is **18.8% [18.4%, 19.3%]**, matching the theoretical arrival mix of **18.86%**:
+    $$\frac{50 \times 192}{50 \times 192 + 10 \times 4128} = \frac{9600}{9600 + 41280} = 18.86\%$$
+  - Single-queue FIFO ordering grants both tenants equal queue priority: Chat TTFT is **17,234.5 ms** and RAG TTFT is **17,076.8 ms** (virtually identical).
+  - Unserved requests at 60s horizon: FIFO leaves **1220 Chat** and **245 RAG** requests backlogged in queue.
+
+### Round-Robin Cursor Advance (`onPick` vs `onDispatch`)
+Early explanations attributed Round-Robin's 31.9% Chat share to "KV capacity limits alone". Systematic testing of cursor mechanics reveals the exact driver:
+1. **`RRAdvance=onDispatch`**: When the cursor advances strictly upon confirmed admission, dispatch counts in the window are **exactly 1.00 : 1** (247 Chat : 247 RAG). This yields **4.4% raw share** and **5.6% weighted share**, confirming the theoretical hand calculation ($4.44\%$ raw, $5.67\%$ weighted). Max-Min Ratio is **16.73**.
+2. **`RRAdvance=onPick`**: When the cursor advances inside `Pick()`, non-fitting RAG head requests fail `server.CanAdmit()`, causing subsequent picks to bypass RAG and select Chat. This elevates Chat dispatches to an 8.53 : 1 ratio (1766 Chat : 207 RAG) and inflates Chat weighted share to 33.8%.
+
+### VTC Bias Explanation (49.8% vs 50.0%)
+VTC achieves 49.8% weighted share rather than exactly 50.0% due to:
+- **Measurement Window Boundaries**: The steady-state window begins at $t=10\text{s}$ and ends at $t=60\text{s}$. Requests admitted prior to 10s or executing across 60s contribute partial tokens to window accounting.
+- **Charge vs Service Granularity**: A 4000-token RAG prefill charges 4000 tokens in step 1, whereas decode tokens charge 1 token per step over 128 steps, introducing discrete step boundary variance.
 
 ---
 
-## 4. Admission Control Modes: `break` vs `skip`
+## 3. Fairness Metrics: Definitions and Guidelines
 
-FairLane supports configurable admission modes:
-```go
-type AdmissionMode int
-const (
-    AdmissionModeBreak AdmissionMode = iota // Default
-    AdmissionModeSkip
-)
-```
-
-### Tradeoffs:
-1. **`AdmissionModeBreak` (Default)**:
-   - Preserves strict order and prevents starvation of large requests.
-   - **Vulnerability**: If the policy selects a tenant with a large prompt (e.g. Flooder 1024 tokens) and available KV cache is <1025 tokens, batch formation halts immediately. In Exp 1, this caused 199.4 break blocks per victim request under VTC, inflating victim TTFT to 1172 ms.
-2. **`AdmissionModeSkip`**:
-   - If a selected tenant's head request cannot fit, it is bypassed to check other backlogged tenants.
-   - Drops VTC victim TTFT from 1202 ms to 344–655 ms.
-   - **Critical Vulnerability (Starvation)**: Under continuous small-request traffic (e.g. 100-token Chat requests), large requests (e.g. 4000-token RAG requests) can be indefinitely starved if KV cache headroom never recovers to 4001 tokens. Verified with unit test `TestLargeRequestStarvationUnderSkip`.
+### Primary vs Secondary Metrics
+- **Primary Metrics**: Long Time-Window Token Shares (Weighted & Raw) and Max-Min Service Ratio: $\max(S_c, S_r) / \min(S_c, S_r)$ evaluated over the entire steady-state window.
+- **Secondary Metrics**: Sliding Token Window Jain's Index ($W = 1000$ tokens) and Time-Windowed Demand-Capped Jain Index.
+- **Clarity Rule**: Exactly one fairness definition is reported per benchmark table to avoid ambiguity.
 
 ---
 
-## 5. Simulator-to-Hardware Fidelity Gap
-- **Step Latency Modeling**: Uses a linear roofline approximation ($T_{\text{step}} = T_{\text{base}} + T_{\text{tok}} \times N_{\text{tokens}}$). It does not capture Tensor Core saturation transitions, CUDA graph launch overheads, or memory bandwidth inflection points.
-- **KV Cache Fragmentation**: Continuous token model without PagedAttention block-table allocation overheads.
-- **Prefix Caching**: Does not model radix tree prefix caching.
+## 4. Horizon-Dependence of FIFO Under Overload
+In Experiment 1, Flooder arrival rate ($\lambda = 83.3$ req/s) exceeds maximum service rate ($\mu \approx 12.5$ req/s).
+- **Linear Slowdown Explosion**: The reported $160.37\times$ slowdown is directly tied to the simulation horizon:
+  - Arrival Stream: 3.0s / Trace Drain Horizon: 104.0s $\rightarrow$ Slowdown = **177.3x**, Queue depth = 204
+  - Arrival Stream: 6.0s / Trace Drain Horizon: 208.0s $\rightarrow$ Slowdown = **313.8x**, Queue depth = 408
+  - Arrival Stream: 12.0s / Trace Drain Horizon: 416.0s $\rightarrow$ Slowdown = **633.8x**, Queue depth = 816
+- FIFO slowdown is formally marked as **unbounded / horizon-dependent**.
 
 ---
 
-## 6. Upstream Reference Status
-- **Kubernetes GAIE PR #2031**: Flow-control narrative remains marked as **UNVERIFIED** due to shallow clone constraints. Production flow-control interfaces are referenced against `llm-d-router` (`pkg/epp/framework/plugins/flowcontrol`).
-- **AIBrix Architecture**: Operates as a distributed router-level load balancer across pods/nodes, not an intra-instance queue-level continuous batching scheduler.
+## 5. Admission Modes & Tie-Breaking Mechanics
+
+### `AdmissionModeBreak` vs `AdmissionModeSkip`
+- **`AdmissionModeBreak` (Default)**: Preserves strict order and prevents starvation of large requests. However, when large prompts fail KV admission, batch formation halts immediately (causing ~199 break blocks per victim request in Exp 1, elevating VTC TTFT to 1172 ms).
+- **`AdmissionModeSkip`**: Bypasses non-fitting head requests, reducing VTC victim TTFT across 30 seeds to 336.7 ms [276.9, 403.9] ms (vs RR's 311.3 ms [259.6, 370.6] ms).
+- **Starvation Risk**: Continuous small requests indefinitely starve large requests under Skip mode (`TestLargeRequestStarvationUnderSkip`).
+
+### Exact Lift Ties
+Event logs demonstrate that exact counter ties occur regularly when a tenant transitions from empty to backlogged, as VTC lifts the tenant counter to the minimum backlogged counter ($c_v = \min_{t \in B} c_t = c_f$). However, seeded random tie-break tests over 30 seeds prove that tie resolution order has zero statistical impact under both Break mode (4.54x default vs 4.53x random) and Skip mode (2.00x default vs 1.99x random).

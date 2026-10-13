@@ -326,3 +326,41 @@ func TestDeterminismAgainstMapIteration(t *testing.T) {
 		})
 	}
 }
+
+func TestRoundRobinAdvanceOnPickVsOnDispatch(t *testing.T) {
+	heads := map[string]policy.RequestView{
+		"chat": &mockRequest{id: "chat-1", tenantID: "chat", arrivalUs: 100},
+		"rag":  &mockRequest{id: "rag-1", tenantID: "rag", arrivalUs: 100},
+	}
+	view := newMockView(heads, 100)
+
+	// 1. Advance OnPick
+	rrPick := policy.NewRoundRobinWithAdvance(policy.RRAdvanceOnPick)
+	first := rrPick.Pick(view)
+	if first != "chat" {
+		t.Fatalf("Expected chat as first pick, got %s", first)
+	}
+	second := rrPick.Pick(view)
+	if second != "rag" {
+		t.Fatalf("Expected cursor to advance on pick to rag, got %s", second)
+	}
+
+	// 2. Advance OnDispatch
+	rrDisp := policy.NewRoundRobinWithAdvance(policy.RRAdvanceOnDispatch)
+	p1 := rrDisp.Pick(view)
+	if p1 != "chat" {
+		t.Fatalf("Expected chat as first pick, got %s", p1)
+	}
+	// Pick again WITHOUT calling OnDispatch
+	p2 := rrDisp.Pick(view)
+	if p2 != "chat" {
+		t.Fatalf("Expected cursor NOT to advance on failed dispatch, got %s (expected chat)", p2)
+	}
+	// Now call OnDispatch for chat
+	rrDisp.OnDispatch(&mockRequest{id: "chat-1", tenantID: "chat", arrivalUs: 100})
+	p3 := rrDisp.Pick(view)
+	if p3 != "rag" {
+		t.Fatalf("Expected cursor to advance to rag after OnDispatch, got %s", p3)
+	}
+}
+

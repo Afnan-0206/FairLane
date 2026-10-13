@@ -47,9 +47,12 @@ def main():
         for p in policies
     ]
 
-    # Request shares
-    chat_req_shares = [p["chat_request_share"]["mean"] * 100 for p in policies]
-    rag_req_shares = [p["rag_request_share"]["mean"] * 100 for p in policies]
+    # Window Dispatches shares
+    chat_disps = [p.get("chat_window_dispatches", {}).get("mean", 0) for p in policies]
+    rag_disps = [p.get("rag_window_dispatches", {}).get("mean", 0) for p in policies]
+    tot_disps = [c + r if (c + r) > 0 else 1.0 for c, r in zip(chat_disps, rag_disps)]
+    chat_req_shares = [c / t * 100 for c, t in zip(chat_disps, tot_disps)]
+    rag_req_shares = [r / t * 100 for r, t in zip(rag_disps, tot_disps)]
 
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5), dpi=300)
     plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')

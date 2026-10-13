@@ -142,12 +142,15 @@ type Exp2PolicyResult struct {
 	RAGRawTokenShare     SummaryStats `json:"rag_raw_token_share"`
 	ChatWeightedShare    SummaryStats `json:"chat_weighted_token_share"`
 	RAGWeightedShare     SummaryStats `json:"rag_weighted_token_share"`
-	ChatRequestShare     SummaryStats `json:"chat_request_share"`
-	RAGRequestShare      SummaryStats `json:"rag_request_share"`
+	ChatWindowDispatches SummaryStats `json:"chat_window_dispatches"`
+	RAGWindowDispatches  SummaryStats `json:"rag_window_dispatches"`
+	ChatUnservedAtEnd    SummaryStats `json:"chat_unserved_at_end"`
+	RAGUnservedAtEnd     SummaryStats `json:"rag_unserved_at_end"`
 	ChatTTFTMeanMs       SummaryStats `json:"chat_ttft_mean_ms"`
 	ChatTTFTP95Ms        SummaryStats `json:"chat_ttft_p95_ms"`
 	RAGTTFTMeanMs        SummaryStats `json:"rag_ttft_mean_ms"`
 	RAGTTFTP95Ms         SummaryStats `json:"rag_ttft_p95_ms"`
+	MaxMinRatioWindow    SummaryStats `json:"max_min_ratio_window"`
 	BothBackloggedSteps  SummaryStats `json:"both_backlogged_steps"`
 	TotalWindowRawTokens SummaryStats `json:"total_window_raw_tokens"`
 }
@@ -200,29 +203,39 @@ func main() {
 		fn   func() policy.Policy
 	}{
 		{"fifo", func() policy.Policy { return policy.NewFIFO() }},
-		{"round-robin", func() policy.Policy { return policy.NewRoundRobin() }},
+		{"round-robin (onPick)", func() policy.Policy { return policy.NewRoundRobinWithAdvance(policy.RRAdvanceOnPick) }},
+		{"round-robin (onDispatch)", func() policy.Policy { return policy.NewRoundRobinWithAdvance(policy.RRAdvanceOnDispatch) }},
 		{"vtc", func() policy.Policy { return policy.NewVTC(policy.DefaultVTCConfig()) }},
 	}
 
-	policyRuns := make(map[string][]struct {
+	type SingleRunMetric struct {
 		chatRawShare    float64
 		ragRawShare     float64
 		chatWeighted    float64
 		ragWeighted     float64
-		chatReqShare    float64
-		ragReqShare     float64
+		chatDisp        float64
+		ragDisp         float64
+		chatUnserved    float64
+		ragUnserved     float64
 		chatTTFTMean    float64
 		chatTTFTP95     float64
 		ragTTFTMean     float64
 		ragTTFTP95      float64
+		maxMinRatio     float64
 		backloggedSteps float64
 		totalRawTokens  float64
-	})
+	}
+
+	policyRuns := make(map[string][]SingleRunMetric)
 
 	for s := int64(0); s < numSeeds; s++ {
 		seed := seedStart + s
 		gen := sim.NewWorkloadGenerator(seed)
 		trace := gen.GenerateTrace([]sim.TenantWorkloadConfig{chatCfg, ragCfg})
+		// CRITICAL: Sort trace by arrival time so chat and rag arrive concurrently
+		sort.Slice(trace, func(i, j int) bool {
+			return trace[i].ArrivalTime() < trace[j].ArrivalTime()
+		})
 
 		for _, p := range policies {
 			pol := p.fn()
@@ -234,7 +247,7 @@ func main() {
 
 			var rawChat, rawRAG int
 			var weightedChat, weightedRAG float64
-			var compChat, compRAG int
+			var winDispChat, winDispRAG int
 			bothSteps := 0
 
 			var chatTTFTs, ragTTFTs []int64
@@ -258,6 +271,13 @@ func main() {
 					if server.CanAdmit(head) {
 						req := qm.PopHead(winner)
 						server.Admit(req, pol, nowUs)
+						if nowUs >= warmupUs && nowUs < horizonUs {
+							if winner == "chat" {
+								winDispChat++
+							} else {
+								winDispRAG++
+							}
+						}
 					} else {
 						// Break on no fit (default)
 						break
@@ -286,14 +306,6 @@ func main() {
 						rawRAG += res.TokensPerTenant["rag"]
 						weightedChat += res.WeightedTokensPerTenant["chat"]
 						weightedRAG += res.WeightedTokensPerTenant["rag"]
-
-						for _, comp := range res.Completed {
-							if comp.TenantID() == "chat" {
-								compChat++
-							} else {
-								compRAG++
-							}
-						}
 					}
 				} else {
 					if qm.TotalQueuedRequests() > 0 {
@@ -308,9 +320,9 @@ func main() {
 
 			totalRaw := float64(rawChat + rawRAG)
 			totalWeighted := weightedChat + weightedRAG
-			totalReqs := float64(compChat + compRAG)
 
-			var cRawShare, rRawShare, cWShare, rWShare, cReqShare, rReqShare float64
+			var cRawShare, rRawShare, cWShare, rWShare float64
+			mmRatio := 1.0
 			if totalRaw > 0 {
 				cRawShare = float64(rawChat) / totalRaw
 				rRawShare = float64(rawRAG) / totalRaw
@@ -318,39 +330,35 @@ func main() {
 			if totalWeighted > 0 {
 				cWShare = weightedChat / totalWeighted
 				rWShare = weightedRAG / totalWeighted
-			}
-			if totalReqs > 0 {
-				cReqShare = float64(compChat) / totalReqs
-				rReqShare = float64(compRAG) / totalReqs
+				if weightedChat > 0 && weightedRAG > 0 {
+					if weightedChat > weightedRAG {
+						mmRatio = weightedChat / weightedRAG
+					} else {
+						mmRatio = weightedRAG / weightedChat
+					}
+				}
 			}
 
 			cPerc := sim.CalculatePercentiles(chatTTFTs)
 			rPerc := sim.CalculatePercentiles(ragTTFTs)
 
-			policyRuns[p.name] = append(policyRuns[p.name], struct {
-				chatRawShare    float64
-				ragRawShare     float64
-				chatWeighted    float64
-				ragWeighted     float64
-				chatReqShare    float64
-				ragReqShare     float64
-				chatTTFTMean    float64
-				chatTTFTP95     float64
-				ragTTFTMean     float64
-				ragTTFTP95      float64
-				backloggedSteps float64
-				totalRawTokens  float64
-			}{
+			unservedChat := float64(qm.QueueDepth("chat"))
+			unservedRAG := float64(qm.QueueDepth("rag"))
+
+			policyRuns[p.name] = append(policyRuns[p.name], SingleRunMetric{
 				chatRawShare:    cRawShare,
 				ragRawShare:     rRawShare,
 				chatWeighted:    cWShare,
 				ragWeighted:     rWShare,
-				chatReqShare:    cReqShare,
-				ragReqShare:     rReqShare,
+				chatDisp:        float64(winDispChat),
+				ragDisp:         float64(winDispRAG),
+				chatUnserved:    unservedChat,
+				ragUnserved:     unservedRAG,
 				chatTTFTMean:    cPerc.Mean / 1000.0,
 				chatTTFTP95:     cPerc.P95 / 1000.0,
 				ragTTFTMean:     rPerc.Mean / 1000.0,
 				ragTTFTP95:      rPerc.P95 / 1000.0,
+				maxMinRatio:     mmRatio,
 				backloggedSteps: float64(bothSteps),
 				totalRawTokens:  totalRaw,
 			})
@@ -358,110 +366,121 @@ func main() {
 	}
 
 	var results []Exp2PolicyResult
+
+	extract := func(runs []SingleRunMetric, fn func(r SingleRunMetric) float64) []float64 {
+		vals := make([]float64, len(runs))
+		for i, r := range runs {
+			vals[i] = fn(r)
+		}
+		return vals
+	}
+
 	for _, p := range policies {
 		runs := policyRuns[p.name]
-		cRaws := make([]float64, len(runs))
-		rRaws := make([]float64, len(runs))
-		cWeights := make([]float64, len(runs))
-		rWeights := make([]float64, len(runs))
-		cReqs := make([]float64, len(runs))
-		rReqs := make([]float64, len(runs))
-		cTTFTMeans := make([]float64, len(runs))
-		cTTFTP95s := make([]float64, len(runs))
-		rTTFTMeans := make([]float64, len(runs))
-		rTTFTP95s := make([]float64, len(runs))
-		steps := make([]float64, len(runs))
-		tokens := make([]float64, len(runs))
-
-		for i, r := range runs {
-			cRaws[i] = r.chatRawShare
-			rRaws[i] = r.ragRawShare
-			cWeights[i] = r.chatWeighted
-			rWeights[i] = r.ragWeighted
-			cReqs[i] = r.chatReqShare
-			rReqs[i] = r.ragReqShare
-			cTTFTMeans[i] = r.chatTTFTMean
-			cTTFTP95s[i] = r.chatTTFTP95
-			rTTFTMeans[i] = r.ragTTFTMean
-			rTTFTP95s[i] = r.ragTTFTP95
-			steps[i] = r.backloggedSteps
-			tokens[i] = r.totalRawTokens
-		}
-
 		res := Exp2PolicyResult{
 			PolicyName:           p.name,
-			ChatRawTokenShare:    computeSummary(cRaws),
-			RAGRawTokenShare:     computeSummary(rRaws),
-			ChatWeightedShare:    computeSummary(cWeights),
-			RAGWeightedShare:     computeSummary(rWeights),
-			ChatRequestShare:     computeSummary(cReqs),
-			RAGRequestShare:      computeSummary(rReqs),
-			ChatTTFTMeanMs:       computeSummary(cTTFTMeans),
-			ChatTTFTP95Ms:        computeSummary(cTTFTP95s),
-			RAGTTFTMeanMs:        computeSummary(rTTFTMeans),
-			RAGTTFTP95Ms:         computeSummary(rTTFTP95s),
-			BothBackloggedSteps:  computeSummary(steps),
-			TotalWindowRawTokens: computeSummary(tokens),
+			ChatRawTokenShare:    computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.chatRawShare })),
+			RAGRawTokenShare:     computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.ragRawShare })),
+			ChatWeightedShare:    computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.chatWeighted })),
+			RAGWeightedShare:     computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.ragWeighted })),
+			ChatWindowDispatches: computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.chatDisp })),
+			RAGWindowDispatches:  computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.ragDisp })),
+			ChatUnservedAtEnd:    computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.chatUnserved })),
+			RAGUnservedAtEnd:     computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.ragUnserved })),
+			ChatTTFTMeanMs:       computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.chatTTFTMean })),
+			ChatTTFTP95Ms:        computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.chatTTFTP95 })),
+			RAGTTFTMeanMs:        computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.ragTTFTMean })),
+			RAGTTFTP95Ms:         computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.ragTTFTP95 })),
+			MaxMinRatioWindow:    computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.maxMinRatio })),
+			BothBackloggedSteps:  computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.backloggedSteps })),
+			TotalWindowRawTokens: computeSummary(extract(runs, func(r SingleRunMetric) float64 { return r.totalRawTokens })),
 		}
 		results = append(results, res)
 	}
 
-	outDir := filepath.Join("experiments", "results")
-	_ = os.MkdirAll(outDir, 0755)
-
-	sumFile := Exp2SummaryFile{
+	summaryFile := Exp2SummaryFile{
 		Experiment:  "exp_heterogeneous_steady_state",
 		Environment: getEnvMetadata(),
 		Policies:    results,
 	}
 
-	jsonBytes, _ := json.MarshalIndent(sumFile, "", "  ")
-	_ = os.WriteFile(filepath.Join(outDir, "exp_heterogeneous_summary.json"), jsonBytes, 0644)
+	resultsDir := filepath.Join("experiments", "results")
+	_ = os.MkdirAll(resultsDir, 0755)
+	summaryPath := filepath.Join(resultsDir, "exp_heterogeneous_summary.json")
 
-	// Print Markdown Table
-	fmt.Printf("\n=== EXPERIMENT 2: STEADY-STATE TOKEN SHARES (N=%d seeds, 95%% CI) ===\n", numSeeds)
-	fmt.Printf("Window: [10.0s, 60.0s], conditioned on BOTH queues backlogged\n")
-	fmt.Printf("| %-14s | %-26s | %-26s |\n",
-		"Policy", "Chat Weighted Share (w=1,2)", "Chat Raw Token Share")
-	fmt.Printf("|----------------|----------------------------|----------------------------|\n")
+	bytes, err := json.MarshalIndent(summaryFile, "", "  ")
+	if err != nil {
+		fmt.Printf("Error marshaling JSON: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(summaryPath, bytes, 0644); err != nil {
+		fmt.Printf("Error writing %s: %v\n", summaryPath, err)
+		return
+	}
 
+	fmt.Println("\n=== EXPERIMENT 2: STEADY-STATE TOKEN SHARES (N=30 seeds, 95% CI) ===")
+	fmt.Println("Window: [10.0s, 60.0s], conditioned on BOTH queues backlogged, sorted arrivals")
+	fmt.Printf("| %-24s | %-24s | %-24s | %-16s |\n",
+		"Policy", "Chat Wtd Share (w=1,2)", "Chat Raw Token Share", "Max-Min Ratio")
+	fmt.Println("|--------------------------|--------------------------|--------------------------|------------------|")
 	for _, r := range results {
-		fmt.Printf("| %-14s | %5.1f%% [%4.1f%%, %4.1f%%]    | %5.1f%% [%4.1f%%, %4.1f%%]    |\n",
+		fmt.Printf("| %-24s | %5.1f%% [%4.1f%%, %4.1f%%]    | %5.1f%% [%4.1f%%, %4.1f%%]    | %5.2f [%4.2f,%4.2f] |\n",
 			r.PolicyName,
 			r.ChatWeightedShare.Mean*100, r.ChatWeightedShare.CI95Low*100, r.ChatWeightedShare.CI95Hi*100,
 			r.ChatRawTokenShare.Mean*100, r.ChatRawTokenShare.CI95Low*100, r.ChatRawTokenShare.CI95Hi*100,
-		)
+			r.MaxMinRatioWindow.Mean, r.MaxMinRatioWindow.CI95Low, r.MaxMinRatioWindow.CI95Hi)
 	}
 
-	fmt.Printf("\nComparison with Hand-Calculated Predictions:\n")
-	fmt.Printf("| %-14s | %-16s | %-16s | %-16s | %-16s |\n",
-		"Policy", "Hand-Calc Wtd", "Measured Wtd CI", "Hand-Calc Raw", "Measured Raw CI")
-	fmt.Printf("|----------------|------------------|------------------|------------------|------------------|\n")
-	fmt.Printf("| %-14s | ~0.0%% - 5.0%%   | %5.1f%% [%4.1f-%4.1f] | <5.0%%           | %5.1f%% [%4.1f-%4.1f] |\n",
-		"fifo",
-		results[0].ChatWeightedShare.Mean*100, results[0].ChatWeightedShare.CI95Low*100, results[0].ChatWeightedShare.CI95Hi*100,
-		results[0].ChatRawTokenShare.Mean*100, results[0].ChatRawTokenShare.CI95Low*100, results[0].ChatRawTokenShare.CI95Hi*100,
-	)
-	fmt.Printf("| %-14s | ~5.7%% (1:1 req) | %5.1f%% [%4.1f-%4.1f] | ~4.4%% (1:1 req) | %5.1f%% [%4.1f-%4.1f] |\n",
-		"round-robin",
-		results[1].ChatWeightedShare.Mean*100, results[1].ChatWeightedShare.CI95Low*100, results[1].ChatWeightedShare.CI95Hi*100,
-		results[1].ChatRawTokenShare.Mean*100, results[1].ChatRawTokenShare.CI95Low*100, results[1].ChatRawTokenShare.CI95Hi*100,
-	)
-	fmt.Printf("| %-14s | ~50.0%%          | %5.1f%% [%4.1f-%4.1f] | ~43.6%%          | %5.1f%% [%4.1f-%4.1f] |\n",
-		"vtc",
-		results[2].ChatWeightedShare.Mean*100, results[2].ChatWeightedShare.CI95Low*100, results[2].ChatWeightedShare.CI95Hi*100,
-		results[2].ChatRawTokenShare.Mean*100, results[2].ChatRawTokenShare.CI95Low*100, results[2].ChatRawTokenShare.CI95Hi*100,
-	)
-
-	fmt.Printf("\nTTFT Performance (Mean / P95):\n")
-	fmt.Printf("| %-14s | %-22s | %-22s |\n",
-		"Policy", "Chat TTFT (Mean / P95)", "RAG TTFT (Mean / P95)")
-	fmt.Printf("|----------------|------------------------|------------------------|\n")
+	fmt.Println("\nDispatches in Window vs Unserved Requests at Horizon (N=30 seeds, 95% CI):")
+	fmt.Printf("| %-24s | %-18s | %-18s | %-18s | %-18s |\n",
+		"Policy", "Win Dispatches Chat", "Win Dispatches RAG", "Unserved Chat", "Unserved RAG")
+	fmt.Println("|--------------------------|--------------------|--------------------|--------------------|--------------------|")
 	for _, r := range results {
-		fmt.Printf("| %-14s | %6.1f ms / %6.1f ms   | %6.1f ms / %6.1f ms   |\n",
+		fmt.Printf("| %-24s | %6.0f [%4.0f, %4.0f]  | %6.0f [%4.0f, %4.0f]  | %6.0f [%4.0f, %4.0f]  | %6.0f [%4.0f, %4.0f]  |\n",
 			r.PolicyName,
-			r.ChatTTFTMeanMs.Mean, r.ChatTTFTP95Ms.Mean,
-			r.RAGTTFTMeanMs.Mean, r.RAGTTFTP95Ms.Mean,
-		)
+			r.ChatWindowDispatches.Mean, r.ChatWindowDispatches.CI95Low, r.ChatWindowDispatches.CI95Hi,
+			r.RAGWindowDispatches.Mean, r.RAGWindowDispatches.CI95Low, r.RAGWindowDispatches.CI95Hi,
+			r.ChatUnservedAtEnd.Mean, r.ChatUnservedAtEnd.CI95Low, r.ChatUnservedAtEnd.CI95Hi,
+			r.RAGUnservedAtEnd.Mean, r.RAGUnservedAtEnd.CI95Low, r.RAGUnservedAtEnd.CI95Hi)
 	}
+
+	fmt.Println("\nComparison with Hand-Calculated Predictions:")
+	fmt.Printf("| %-24s | %-16s | %-18s | %-16s | %-18s |\n",
+		"Policy", "Hand-Calc Wtd", "Measured Wtd CI", "Hand-Calc Raw", "Measured Raw CI")
+	fmt.Println("|--------------------------|------------------|--------------------|------------------|--------------------|")
+	for _, r := range results {
+		var predWtd, predRaw string
+		switch r.PolicyName {
+		case "fifo":
+			predWtd = "~22.8% (arr mix)"
+			predRaw = "~18.9% (arr mix)"
+		case "round-robin (onDispatch)":
+			predWtd = "~5.7% (1:1 req)"
+			predRaw = "~4.4% (1:1 req)"
+		case "round-robin (onPick)":
+			predWtd = "~30%-35% (bypass)"
+			predRaw = "~25%-30% (bypass)"
+		case "vtc":
+			predWtd = "~50.0% (token-fair)"
+			predRaw = "~43.6% (token-fair)"
+		}
+		fmt.Printf("| %-24s | %-16s | %5.1f%% [%4.1f-%4.1f] | %-16s | %5.1f%% [%4.1f-%4.1f] |\n",
+			r.PolicyName, predWtd,
+			r.ChatWeightedShare.Mean*100, r.ChatWeightedShare.CI95Low*100, r.ChatWeightedShare.CI95Hi*100,
+			predRaw,
+			r.ChatRawTokenShare.Mean*100, r.ChatRawTokenShare.CI95Low*100, r.ChatRawTokenShare.CI95Hi*100)
+	}
+
+	fmt.Println("\nTTFT Performance (Mean / P95):")
+	fmt.Printf("| %-24s | %-26s | %-26s |\n",
+		"Policy", "Chat TTFT Mean ms (95% CI)", "RAG TTFT Mean ms (95% CI)")
+	fmt.Println("|--------------------------|----------------------------|----------------------------|")
+	for _, r := range results {
+		fmt.Printf("| %-24s | %6.1f [%5.1f, %5.1f] ms   | %6.1f [%5.1f, %5.1f] ms   |\n",
+			r.PolicyName,
+			r.ChatTTFTMeanMs.Mean, r.ChatTTFTMeanMs.CI95Low, r.ChatTTFTMeanMs.CI95Hi,
+			r.RAGTTFTMeanMs.Mean, r.RAGTTFTMeanMs.CI95Low, r.RAGTTFTMeanMs.CI95Hi)
+	}
+
+	fmt.Printf("\nSaved summary to: %s\n", summaryPath)
 }
