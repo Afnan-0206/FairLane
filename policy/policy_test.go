@@ -18,6 +18,7 @@ type mockRequest struct {
 	tenantID  string
 	input     int
 	predOut   int
+	priority  int
 	arrivalUs int64
 }
 
@@ -26,6 +27,7 @@ func (r *mockRequest) TenantID() string              { return r.tenantID }
 func (r *mockRequest) InputTokens() int              { return r.input }
 func (r *mockRequest) PredictedOutputTokens() int     { return r.predOut }
 func (r *mockRequest) ArrivalTime() int64            { return r.arrivalUs }
+func (r *mockRequest) Priority() int                 { return r.priority }
 
 // mockSchedulerView implements policy.SchedulerView
 type mockSchedulerView struct {

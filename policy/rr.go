@@ -6,21 +6,27 @@ import "sync"
 type RRAdvanceMode int
 
 const (
-	// RRAdvanceOnPick advances the cursor immediately when Pick() is called (Default).
-	// Bypasses tenants whose head requests cannot currently fit into the batch/KV cache.
-	RRAdvanceOnPick RRAdvanceMode = iota
+	// RRAdvanceUpstream models upstream llm-d-router: the cursor advances when Pick() is called.
+	// When a candidate request fails engine admission (e.g. KV cache headroom), the cursor
+	// has already advanced, allowing subsequent cycles to evaluate other backlogged flows.
+	RRAdvanceUpstream RRAdvanceMode = iota
 
-	// RRAdvanceOnDispatch advances the cursor only when OnDispatch() is confirmed by the server.
-	// Preserves strict cyclic turns even when a head request fails admission under break-on-no-fit.
-	RRAdvanceOnDispatch
+	// RRAdvanceIdealized models idealized 1:1 request round-robin: the cursor advances strictly
+	// when OnDispatch() is confirmed by the engine. If a candidate fails admission, the cursor
+	// remains on that flow, enforcing strict cyclic turns regardless of engine KV headroom.
+	RRAdvanceIdealized
+
+	// Backward-compatible aliases:
+	RRAdvanceOnPick     = RRAdvanceUpstream
+	RRAdvanceOnDispatch = RRAdvanceIdealized
 )
 
 func (m RRAdvanceMode) String() string {
 	switch m {
-	case RRAdvanceOnPick:
-		return "onPick"
-	case RRAdvanceOnDispatch:
-		return "onDispatch"
+	case RRAdvanceUpstream:
+		return "upstream"
+	case RRAdvanceIdealized:
+		return "idealized"
 	default:
 		return "unknown"
 	}
@@ -36,7 +42,15 @@ type RoundRobin struct {
 }
 
 func NewRoundRobin() *RoundRobin {
-	return &RoundRobin{advanceMode: RRAdvanceOnPick}
+	return &RoundRobin{advanceMode: RRAdvanceUpstream}
+}
+
+func NewRoundRobinUpstream() *RoundRobin {
+	return &RoundRobin{advanceMode: RRAdvanceUpstream}
+}
+
+func NewRoundRobinIdealized() *RoundRobin {
+	return &RoundRobin{advanceMode: RRAdvanceIdealized}
 }
 
 func NewRoundRobinWithAdvance(mode RRAdvanceMode) *RoundRobin {
@@ -44,10 +58,10 @@ func NewRoundRobinWithAdvance(mode RRAdvanceMode) *RoundRobin {
 }
 
 func (p *RoundRobin) Name() string {
-	if p.advanceMode == RRAdvanceOnDispatch {
-		return "round-robin (onDispatch)"
+	if p.advanceMode == RRAdvanceIdealized {
+		return "round-robin-idealized"
 	}
-	return "round-robin"
+	return "round-robin-upstream"
 }
 
 func (p *RoundRobin) AdvanceMode() RRAdvanceMode {
@@ -95,7 +109,7 @@ func (p *RoundRobin) Pick(view SchedulerView) string {
 	}
 
 	p.candidate = chosen
-	if p.advanceMode == RRAdvanceOnPick {
+	if p.advanceMode == RRAdvanceUpstream {
 		p.lastSelected = chosen
 	}
 	return chosen
@@ -104,7 +118,7 @@ func (p *RoundRobin) Pick(view SchedulerView) string {
 func (p *RoundRobin) OnDispatch(req RequestView) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.advanceMode == RRAdvanceOnDispatch {
+	if p.advanceMode == RRAdvanceIdealized {
 		p.lastSelected = req.TenantID()
 	}
 }
