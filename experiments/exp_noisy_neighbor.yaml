@@ -1,0 +1,74 @@
+# FairLane Experiment 1: Noisy Neighbor Protection
+# Thesis: Under request-count fairness and FIFO, tenants with heterogeneous token costs starve each other.
+# Hypothesis:
+#   1. Under FIFO, the flooding tenant monopolizes the queue, causing severe victim slowdown (>3x vs solo).
+#   2. Under Round-Robin (request-count), because the flooder's requests consume >6x the tokens of the victim,
+#      RR still allows the flooder to dominate GPU token-seconds, failing to isolate the victim (>2x slowdown).
+#   3. Under VTC, token-aware virtual timeline tracking restores resource equity, ensuring victim slowdown
+#      remains close to solo baseline (~1.0-1.3x) and Jain's index is maximized.
+
+experiment_name: "exp_noisy_neighbor"
+seeds_count: 30
+seed_start: 100
+
+server:
+  kv_capacity_tokens: 4096
+  max_batch_size: 16
+  base_step_time_us: 5000   # 5 ms per step
+  per_token_cost_us: 5      # 5 µs per token
+
+sliding_window_tokens: 1000
+
+workload:
+  tenants:
+    - tenant_id: "victim"
+      request_count: 60
+      arrival_process: "poisson"
+      mean_interval_us: 50000 # 1 req / 50ms (light demand, strictly below 50% fair share)
+      prompt_length_min: 128
+      prompt_length_max: 128
+      output_length_min: 64
+      output_length_max: 64
+
+    - tenant_id: "flooder"
+      request_count: 240
+      arrival_process: "poisson"
+      mean_interval_us: 12000 # 1 req / 12ms (heavy demand, saturates capacity)
+      prompt_length_min: 1024
+      prompt_length_max: 1024
+      output_length_min: 256
+      output_length_max: 256
+
+policies:
+  - name: "fifo"
+  - name: "round-robin"
+  - name: "vtc-default"
+    w_in: 1.0
+    w_out: 2.0
+    lift_mode: "artifact"
+    lift_timing: "arrival"
+    charging_model: "incremental"
+  - name: "vtc-paper-lift"
+    w_in: 1.0
+    w_out: 2.0
+    lift_mode: "paper"
+    lift_timing: "arrival"
+    charging_model: "incremental"
+  - name: "vtc-completion-charge"
+    w_in: 1.0
+    w_out: 2.0
+    lift_mode: "artifact"
+    lift_timing: "arrival"
+    charging_model: "completion"
+  - name: "vtc-wout-1"
+    w_in: 1.0
+    w_out: 1.0
+  - name: "vtc-wout-2"
+    w_in: 1.0
+    w_out: 2.0
+  - name: "vtc-wout-3"
+    w_in: 1.0
+    w_out: 3.0
+  - name: "vtc-wout-4"
+    w_in: 1.0
+    w_out: 4.0

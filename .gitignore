@@ -1,0 +1,6 @@
+.venv/
+*.exe
+__pycache__/
+*.pyc
+experiments/results/
+
