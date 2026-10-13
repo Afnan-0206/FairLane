@@ -377,3 +377,95 @@ func TestJainsDemandCappedHandComputed(t *testing.T) {
 	}
 }
 
+// TestGeneratedTracesSorted verifies that GenerateTrace always outputs requests sorted by arrival time.
+func TestGeneratedTracesSorted(t *testing.T) {
+	gen := sim.NewWorkloadGenerator(42)
+	cfg1 := sim.TenantWorkloadConfig{
+		TenantID:       "tenant-1",
+		RequestCount:   50,
+		ArrivalProcess: "poisson",
+		MeanIntervalUs: 20000,
+	}
+	cfg2 := sim.TenantWorkloadConfig{
+		TenantID:       "tenant-2",
+		RequestCount:   50,
+		ArrivalProcess: "poisson",
+		MeanIntervalUs: 50000,
+	}
+
+	trace := gen.GenerateTrace([]sim.TenantWorkloadConfig{cfg1, cfg2})
+	if len(trace) != 100 {
+		t.Fatalf("expected 100 requests, got %d", len(trace))
+	}
+
+	for i := 1; i < len(trace); i++ {
+		if trace[i].ArrivalTime() < trace[i-1].ArrivalTime() {
+			t.Fatalf("trace not sorted at index %d: %s (%d us) before %s (%d us)",
+				i, trace[i-1].ID(), trace[i-1].ArrivalTime(), trace[i].ID(), trace[i].ArrivalTime())
+		}
+	}
+}
+
+// TestSimulatorRejectsUnsortedInput verifies that Simulator.Run panics if fed an unsorted trace.
+func TestSimulatorRejectsUnsortedInput(t *testing.T) {
+	serverCfg := sim.ServerConfig{
+		KVCapacityTokens: 1000,
+		MaxBatchSize:     10,
+		BaseStepTimeUs:   1000,
+		PerTokenCostUs:   1,
+	}
+	s := sim.NewSimulator(serverCfg, policy.NewFIFO(), 500)
+
+	r1 := sim.NewRequest("r1", "t1", 100, 10, 0, 5000)
+	r2 := sim.NewRequest("r2", "t1", 100, 10, 0, 2000) // arrived earlier than r1!
+	unsortedTrace := []*sim.Request{r1, r2}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected Simulator.Run to panic on unsorted input, but it did not")
+		}
+	}()
+
+	s.Run(unsortedTrace)
+}
+
+// TestExp1TracePasses verifies that the actual Experiment 1 trace is sorted and runs without panic.
+func TestExp1TracePasses(t *testing.T) {
+	serverCfg := sim.ServerConfig{
+		KVCapacityTokens: 4096,
+		MaxBatchSize:     16,
+		BaseStepTimeUs:   5000,
+		PerTokenCostUs:   5,
+	}
+	gen := sim.NewWorkloadGenerator(100)
+	victimCfg := sim.TenantWorkloadConfig{
+		TenantID:        "victim",
+		RequestCount:    60,
+		ArrivalProcess:  "poisson",
+		MeanIntervalUs:  50000,
+		PromptLengthMin: 128,
+		PromptLengthMax: 128,
+		OutputLengthMin: 64,
+		OutputLengthMax: 64,
+	}
+	flooderCfg := sim.TenantWorkloadConfig{
+		TenantID:        "flooder",
+		RequestCount:    240,
+		ArrivalProcess:  "poisson",
+		MeanIntervalUs:  12000,
+		PromptLengthMin: 1024,
+		PromptLengthMax: 1024,
+		OutputLengthMin: 256,
+		OutputLengthMax: 256,
+	}
+
+	trace := gen.GenerateTrace([]sim.TenantWorkloadConfig{victimCfg, flooderCfg})
+	s := sim.NewSimulator(serverCfg, policy.NewFIFO(), 1000)
+	metrics := s.Run(trace)
+	if metrics.TotalCompletedReqs != 300 {
+		t.Fatalf("expected 300 completed requests in Exp 1 trace, got %d", metrics.TotalCompletedReqs)
+	}
+}
+
+

@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"math"
 	"math/rand"
+	"sort"
 )
 
 // TenantWorkloadConfig defines the traffic profile of an individual tenant.
@@ -94,6 +95,14 @@ func (g *WorkloadGenerator) GenerateTrace(configs []TenantWorkloadConfig) []*Req
 			allRequests = append(allRequests, req)
 		}
 	}
+
+	// INVARIANT: Generated multi-tenant traces MUST be deterministically sorted by arrival time
+	sort.SliceStable(allRequests, func(i, j int) bool {
+		if allRequests[i].ArrivalTime() != allRequests[j].ArrivalTime() {
+			return allRequests[i].ArrivalTime() < allRequests[j].ArrivalTime()
+		}
+		return allRequests[i].ID() < allRequests[j].ID()
+	})
 
 	return allRequests
 }
