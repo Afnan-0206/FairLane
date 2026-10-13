@@ -9,7 +9,6 @@ import (
 	"fairlane/sim"
 )
 
-// RandomTieVTC wraps VTC but breaks exact ties randomly using a seeded PRNG
 type RandomTieVTC struct {
 	*policy.VTC
 	rng *rand.Rand
@@ -46,7 +45,6 @@ func (p *RandomTieVTC) Pick(view policy.SchedulerView) string {
 		return minTenants[0]
 	}
 
-	// Random tie break
 	idx := p.rng.Intn(len(minTenants))
 	return minTenants[idx]
 }
@@ -69,21 +67,10 @@ func runDiagnosis() {
 		PerTokenCostUs:   5,
 	}
 
-	// Experiment variants to test:
-	// 1. RR baseline
-	// 2. VTC default (flooder < victim, break-on-no-fit)
-	// 3. VTC swapped names (victim = "a_victim", flooder = "z_flooder")
-	// 4. VTC random tie-break
-	// 5. VTC with skip-on-no-fit (bypass) vs break-on-no-fit
-
 	type Result struct {
-		name              string
-		victimSlowdown    []float64
-		victimTTFTMs      []float64
-		victimQueueWaitMs []float64
-		victimPrefillMs   []float64
-		tiesCount         []int
-		blockedByFlooder  []int
+		name           string
+		victimSlowdown []float64
+		victimTTFTMs   []float64
 	}
 
 	results := map[string]*Result{
@@ -97,7 +84,6 @@ func runDiagnosis() {
 		seed := seedStart + s
 		gen := sim.NewWorkloadGenerator(seed)
 
-		// Solo run for baseline
 		soloCfg := sim.TenantWorkloadConfig{
 			TenantID:        "victim",
 			RequestCount:    60,
@@ -113,7 +99,6 @@ func runDiagnosis() {
 		soloMet := soloSim.Run(soloTrace)
 		victimSoloLat := soloMet.PerTenant["victim"].TotalLatencyUs.Mean
 
-		// Standard co-located trace
 		flooderCfg := sim.TenantWorkloadConfig{
 			TenantID:        "flooder",
 			RequestCount:    240,
@@ -126,7 +111,6 @@ func runDiagnosis() {
 		}
 		colocTrace := gen.GenerateTrace([]sim.TenantWorkloadConfig{soloCfg, flooderCfg})
 
-		// Swapped co-located trace
 		swappedVictimCfg := soloCfg
 		swappedVictimCfg.TenantID = "a_victim"
 		swappedFlooderCfg := flooderCfg
@@ -193,7 +177,6 @@ func runDiagnosis() {
 			r.name, mean(r.victimSlowdown), mean(r.victimTTFTMs))
 	}
 
-	// Now diagnose decomposition and blocking on seed 100 in detail
 	diagnoseTraceDetails(serverCfg)
 }
 
@@ -222,23 +205,16 @@ func diagnoseTraceDetails(serverCfg sim.ServerConfig) {
 	}
 
 	trace := gen.GenerateTrace([]sim.TenantWorkloadConfig{victimCfg, flooderCfg})
-
-	// Run detailed simulation tracking
-	// Sort trace
 	sort.Slice(trace, func(i, j int) bool {
 		return trace[i].ArrivalTime() < trace[j].ArrivalTime()
 	})
 
-	for _, polName := range []string{"round-robin", "vtc", "vtc-skip-on-no-fit"} {
+	for _, polName := range []string{"round-robin", "vtc"} {
 		var pol policy.Policy
-		skipOnNoFit := false
 		if polName == "round-robin" {
 			pol = policy.NewRoundRobin()
-		} else if polName == "vtc" {
-			pol = policy.NewVTC(policy.DefaultVTCConfig())
 		} else {
 			pol = policy.NewVTC(policy.DefaultVTCConfig())
-			skipOnNoFit = true
 		}
 
 		server := sim.NewServer(serverCfg)
@@ -247,19 +223,14 @@ func diagnoseTraceDetails(serverCfg sim.ServerConfig) {
 		var nowUs int64 = 0
 		traceIdx := 0
 
-		// Diagnostics per victim request:
 		type ReqDiag struct {
 			arrUs            int64
 			dispUs           int64
 			firstTokUs       int64
-			admitsWhileQueue int // other admissions while this req was in queue
-			breakBlocks      int // times break-on-no-fit occurred while this req was waiting
-			kvFullBlocks     int // times server was at max batch / KV full
+			admitsWhileQueue int
+			breakBlocks      int
 		}
 		diagMap := make(map[string]*ReqDiag)
-
-		var breakBlocksTotal int
-		var flooderPickWhenVictimQueued int
 
 		for traceIdx < len(trace) || qm.TotalQueuedRequests() > 0 || server.RunningCount() > 0 {
 			for traceIdx < len(trace) && trace[traceIdx].ArrivalTime() <= nowUs {
@@ -272,7 +243,6 @@ func diagnoseTraceDetails(serverCfg sim.ServerConfig) {
 			}
 			qm.SetCurrentTime(nowUs)
 
-			// Batch formation
 			for server.RunningCount() < serverCfg.MaxBatchSize && qm.TotalQueuedRequests() > 0 {
 				winner := pol.Pick(qm)
 				if winner == "" {
@@ -292,7 +262,6 @@ func diagnoseTraceDetails(serverCfg sim.ServerConfig) {
 					if req.TenantID() == "victim" {
 						diagMap[req.ID()].dispUs = nowUs
 					} else if victimWaiting {
-						// Flooder admitted while victim was waiting
 						for _, d := range diagMap {
 							if d.dispUs == 0 {
 								d.admitsWhileQueue++
@@ -300,8 +269,6 @@ func diagnoseTraceDetails(serverCfg sim.ServerConfig) {
 						}
 					}
 				} else {
-					// Cannot admit winner
-					breakBlocksTotal++
 					if victimWaiting && winner == "flooder" {
 						for _, d := range diagMap {
 							if d.dispUs == 0 {
@@ -309,23 +276,7 @@ func diagnoseTraceDetails(serverCfg sim.ServerConfig) {
 							}
 						}
 					}
-					if !skipOnNoFit {
-						break
-					}
-					// If skipOnNoFit, try next tenant (e.g. victim)
-					if winner == "flooder" && victimWaiting {
-						headV, okV := qm.HeadRequest("victim")
-						if okV && server.CanAdmit(headV) {
-							reqV := qm.PopHead("victim")
-							server.Admit(reqV, pol, nowUs)
-							diagMap[reqV.ID()].dispUs = nowUs
-						}
-					}
 					break
-				}
-
-				if victimWaiting && winner == "flooder" {
-					flooderPickWhenVictimQueued++
 				}
 			}
 
@@ -348,7 +299,6 @@ func diagnoseTraceDetails(serverCfg sim.ServerConfig) {
 			}
 		}
 
-		// Calculate averages for victim
 		var totalTTFT, totalQueueWait, totalPrefill int64
 		var totalAdmitsWaited, totalBreakBlocks int
 		n := len(diagMap)
@@ -373,4 +323,3 @@ func diagnoseTraceDetails(serverCfg sim.ServerConfig) {
 		fmt.Printf("  Mean Break-On-No-Fit Blocks:   %6.1f per victim req\n", float64(totalBreakBlocks)/float64(n))
 	}
 }
-

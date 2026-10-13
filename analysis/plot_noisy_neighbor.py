@@ -16,7 +16,8 @@ def main():
         return
 
     with open(summary_path, "r") as f:
-        summaries = json.load(f)
+        data = json.load(f)
+    summaries = data["policies"] if isinstance(data, dict) and "policies" in data else data
 
     with open(raw_path, "r") as f:
         raw_data = json.load(f)
