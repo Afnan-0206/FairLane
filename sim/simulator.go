@@ -1,7 +1,7 @@
 package sim
 
 import (
-	"sort"
+	"fmt"
 
 	"fairlane/policy"
 )
@@ -30,6 +30,12 @@ func (m AdmissionMode) String() string {
 	}
 }
 
+// GatewayConfig configures the two-tier gateway and inference engine queueing model.
+type GatewayConfig struct {
+	Enabled      bool
+	MaxInFlightK int // Maximum concurrent in-flight requests in downstream engine (engine queue + running batch)
+}
+
 // Simulator drives the discrete-event execution of workload traces through a fairness policy.
 type Simulator struct {
 	server       *Server
@@ -38,12 +44,15 @@ type Simulator struct {
 
 	admissionMode AdmissionMode
 
+	gatewayCfg      GatewayConfig
+	engineFCFSQueue []*Request // Downstream engine FCFS queue (Gateway mode)
+
 	slidingWindowTokens int
 	windowAllocations   []map[string]float64 // historical token allocations per token window
 
-	timeWindowUs         int64
-	timeWindowAllocs     []map[string]float64 // historical token allocations per time window
-	timeWindowDemands    []map[string]float64 // active tenant demands per time window
+	timeWindowUs      int64
+	timeWindowAllocs  []map[string]float64 // historical token allocations per time window
+	timeWindowDemands []map[string]float64 // active tenant demands per time window
 
 	// Tracking metrics
 	idleWhileQueuedUs int64
@@ -60,10 +69,24 @@ func NewSimulator(serverCfg ServerConfig, pol policy.Policy, slidingWindowTokens
 		queueManager:        NewTenantQueueManager(),
 		policy:              pol,
 		admissionMode:       AdmissionModeBreak, // Default is break-on-no-fit
+		gatewayCfg:          GatewayConfig{Enabled: false, MaxInFlightK: 16},
+		engineFCFSQueue:     make([]*Request, 0),
 		slidingWindowTokens: slidingWindowTokens,
 		timeWindowUs:        500000, // 500ms time window
 		submittedCount:      make(map[string]int),
 	}
+}
+
+func (s *Simulator) SetGatewayConfig(cfg GatewayConfig) {
+	s.gatewayCfg = cfg
+}
+
+func (s *Simulator) GatewayConfig() GatewayConfig {
+	return s.gatewayCfg
+}
+
+func (s *Simulator) EngineInFlight() int {
+	return len(s.engineFCFSQueue) + s.server.RunningCount()
 }
 
 func (s *Simulator) SetAdmissionMode(mode AdmissionMode) {
@@ -112,16 +135,16 @@ func (v *filteredSchedulerView) CurrentTime() int64 {
 }
 
 // Run executes the simulation until all requests in the trace complete.
+// INVARIANT: The trace MUST be strictly sorted by arrival time. Unsorted input is rejected.
 func (s *Simulator) Run(trace []*Request) SimulationMetrics {
-	// Sort trace deterministically by arrival time, tie-breaking by ID
-	sortedTrace := make([]*Request, len(trace))
-	copy(sortedTrace, trace)
-	sort.Slice(sortedTrace, func(i, j int) bool {
-		if sortedTrace[i].arrivalUs == sortedTrace[j].arrivalUs {
-			return sortedTrace[i].id < sortedTrace[j].id
+	for i := 1; i < len(trace); i++ {
+		if trace[i].arrivalUs < trace[i-1].arrivalUs {
+			panic(fmt.Sprintf("Simulator.Run: trace is not sorted by arrival time: index %d (%s, %d us) arrived before index %d (%s, %d us)",
+				i, trace[i].id, trace[i].arrivalUs, i-1, trace[i-1].id, trace[i-1].arrivalUs))
 		}
-		return sortedTrace[i].arrivalUs < sortedTrace[j].arrivalUs
-	})
+	}
+
+	sortedTrace := trace
 
 	for _, r := range sortedTrace {
 		s.submittedCount[r.tenantID]++
@@ -138,7 +161,7 @@ func (s *Simulator) Run(trace []*Request) SimulationMetrics {
 	var lastTimeWindowUs int64 = 0
 	currentTimeWindowAlloc := make(map[string]float64)
 
-	for traceIdx < totalRequests || s.queueManager.TotalQueuedRequests() > 0 || s.server.RunningCount() > 0 {
+	for traceIdx < totalRequests || s.queueManager.TotalQueuedRequests() > 0 || len(s.engineFCFSQueue) > 0 || s.server.RunningCount() > 0 {
 		// 1. Enqueue all requests that have arrived up to nowUs
 		for traceIdx < totalRequests && sortedTrace[traceIdx].arrivalUs <= nowUs {
 			req := sortedTrace[traceIdx]
@@ -148,8 +171,35 @@ func (s *Simulator) Run(trace []*Request) SimulationMetrics {
 
 		s.queueManager.SetCurrentTime(nowUs)
 
-		// 2. Batch formation: Admit eligible requests using policy.Pick
-		if s.admissionMode == AdmissionModeBreak {
+		// 2. Batch formation: Gateway mode or Direct server admission
+		if s.gatewayCfg.Enabled {
+			// Phase A: Dispatch from Gateway tenant queues to Engine FCFS queue up to MaxInFlightK
+			for s.EngineInFlight() < s.gatewayCfg.MaxInFlightK && s.queueManager.TotalQueuedRequests() > 0 {
+				winnerTenant := s.policy.Pick(s.queueManager)
+				if winnerTenant == "" {
+					break
+				}
+				headReq, ok := s.queueManager.HeadRequest(winnerTenant)
+				if !ok || headReq == nil {
+					break
+				}
+				req := s.queueManager.PopHead(winnerTenant)
+				s.policy.OnDispatch(req)
+				s.engineFCFSQueue = append(s.engineFCFSQueue, req)
+			}
+
+			// Phase B: Engine admits from its internal FCFS queue into running batch
+			for s.server.RunningCount() < s.server.cfg.MaxBatchSize && len(s.engineFCFSQueue) > 0 {
+				headReq := s.engineFCFSQueue[0]
+				if s.server.CanAdmit(headReq) {
+					s.engineFCFSQueue = s.engineFCFSQueue[1:]
+					// Pass nil policy so OnDispatch is not invoked twice
+					s.server.Admit(headReq, nil, nowUs)
+				} else {
+					break
+				}
+			}
+		} else if s.admissionMode == AdmissionModeBreak {
 			for s.server.RunningCount() < s.server.cfg.MaxBatchSize && s.queueManager.TotalQueuedRequests() > 0 {
 				winnerTenant := s.policy.Pick(s.queueManager)
 				if winnerTenant == "" {
@@ -261,7 +311,7 @@ func (s *Simulator) Run(trace []*Request) SimulationMetrics {
 			}
 		} else {
 			// Server is idle (running == 0)
-			queuedCount := s.queueManager.TotalQueuedRequests()
+			queuedCount := s.queueManager.TotalQueuedRequests() + len(s.engineFCFSQueue)
 			if queuedCount > 0 {
 				// IDLE-WHILE-QUEUED VIOLATION TRACKING:
 				// If server is idle while requests are waiting, record the anomaly

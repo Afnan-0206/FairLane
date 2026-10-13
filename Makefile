@@ -21,6 +21,9 @@ exp-heterogeneous:
 diagnose:
 	$(GO) run ./cmd/diagnose
 
+exp-phase2a:
+	$(GO) run ./cmd/exp_phase2a
+
 clean:
 	rm -rf experiments/results/*.json experiments/results/*.png
 

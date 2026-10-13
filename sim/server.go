@@ -77,7 +77,9 @@ func (s *Server) Admit(req *Request, pol policy.Policy, nowUs int64) {
 	s.usedKV += req.inputTokens
 
 	// Notify policy of admission
-	pol.OnDispatch(req)
+	if pol != nil {
+		pol.OnDispatch(req)
+	}
 }
 
 // StepResult summarizes the execution of one continuous batching step.
