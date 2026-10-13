@@ -1,7 +1,7 @@
-.PHONY: all test exp-noisy-neighbor exp-heterogeneous clean
+.PHONY: all test exp-noisy-neighbor exp-heterogeneous diagnose clean
 
-GO := "C:/Program Files/Go/bin/go.exe"
-PYTHON := .venv/Scripts/python.exe
+GO ?= go
+PYTHON ?= python
 
 all: test
 
@@ -18,5 +18,9 @@ exp-heterogeneous:
 	$(GO) run ./cmd/exp_heterogeneous
 	$(PYTHON) ./analysis/plot_heterogeneous.py
 
+diagnose:
+	$(GO) run ./cmd/diagnose
+
 clean:
 	rm -rf experiments/results/*.json experiments/results/*.png
+

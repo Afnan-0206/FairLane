@@ -3,6 +3,7 @@ setlocal
 if "%1"=="" goto test
 if "%1"=="exp-noisy-neighbor" goto exp_noisy
 if "%1"=="exp-heterogeneous" goto exp_hetero
+if "%1"=="diagnose" goto diagnose
 if "%1"=="test" goto test
 if "%1"=="clean" goto clean
 goto unknown
@@ -30,6 +31,10 @@ if exist .venv\Scripts\python.exe (
 ) else (
     python ./analysis/plot_heterogeneous.py
 )
+goto end
+
+:diagnose
+"C:\Program Files\Go\bin\go.exe" run ./cmd/diagnose
 goto end
 
 :clean

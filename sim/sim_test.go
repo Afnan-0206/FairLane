@@ -2,6 +2,7 @@ package sim_test
 
 import (
 	"fmt"
+	"math"
 	"testing"
 
 	"fairlane/policy"
@@ -249,3 +250,130 @@ func TestSameTenantRejoin(t *testing.T) {
 		})
 	}
 }
+
+// TestAdmissionModeBreakVsSkip verifies that Break halts admission while Skip allows smaller requests to bypass.
+func TestAdmissionModeBreakVsSkip(t *testing.T) {
+	serverCfg := sim.ServerConfig{
+		KVCapacityTokens: 500,
+		MaxBatchSize:     10,
+		BaseStepTimeUs:   1000,
+		PerTokenCostUs:   1,
+	}
+
+	// r1 (running): 300 input tokens -> takes 300 KV.
+	// rLarge (tenant-large, arrived at 10): 250 input tokens -> needs 251 KV, cannot fit in remaining 200 KV!
+	// rSmall (tenant-small, arrived at 20): 50 input tokens -> needs 51 KV, would fit in remaining 200 KV!
+	r1 := sim.NewRequest("r1", "t0", 300, 50, 0, 0)
+	rLarge := sim.NewRequest("r-large", "t-large", 250, 20, 0, 10)
+	rSmall := sim.NewRequest("r-small", "t-small", 50, 10, 0, 20)
+
+	// Mode 1: Break (default)
+	{
+		simBreak := sim.NewSimulator(serverCfg, policy.NewFIFO(), 500)
+		simBreak.SetAdmissionMode(sim.AdmissionModeBreak)
+		trace := []*sim.Request{r1, rLarge, rSmall}
+		simBreak.Run(trace)
+
+		// Under Break, r-large must be dispatched BEFORE r-small
+		if rSmall.DispatchedTime() < rLarge.DispatchedTime() {
+			t.Fatalf("under AdmissionModeBreak, rSmall should NOT bypass rLarge! (small: %d, large: %d)",
+				rSmall.DispatchedTime(), rLarge.DispatchedTime())
+		}
+	}
+
+	// Mode 2: Skip
+	{
+		r1B := sim.NewRequest("r1", "t0", 300, 50, 0, 0)
+		rLargeB := sim.NewRequest("r-large", "t-large", 250, 20, 0, 10)
+		rSmallB := sim.NewRequest("r-small", "t-small", 50, 10, 0, 20)
+
+		simSkip := sim.NewSimulator(serverCfg, policy.NewFIFO(), 500)
+		simSkip.SetAdmissionMode(sim.AdmissionModeSkip)
+		trace := []*sim.Request{r1B, rLargeB, rSmallB}
+		simSkip.Run(trace)
+
+		// Under Skip, rSmall CAN bypass rLarge while rLarge cannot fit!
+		if rSmallB.DispatchedTime() >= rLargeB.DispatchedTime() {
+			t.Fatalf("under AdmissionModeSkip, rSmall should bypass non-fitting rLarge! (small: %d, large: %d)",
+				rSmallB.DispatchedTime(), rLargeB.DispatchedTime())
+		}
+	}
+}
+
+// TestLargeRequestStarvationUnderSkip proves that Skip mode can starve a large request indefinitely
+// when small requests continually occupy the KV cache.
+func TestLargeRequestStarvationUnderSkip(t *testing.T) {
+	serverCfg := sim.ServerConfig{
+		KVCapacityTokens: 500,
+		MaxBatchSize:     10,
+		BaseStepTimeUs:   1000,
+		PerTokenCostUs:   1,
+	}
+
+	simSkip := sim.NewSimulator(serverCfg, policy.NewFIFO(), 500)
+	simSkip.SetAdmissionMode(sim.AdmissionModeSkip)
+
+	// rBase occupies 200 tokens initially (from t=0 to t=100000).
+	rBase := sim.NewRequest("r-base", "tenant-base", 200, 100, 0, 0)
+
+	// Large request arrives at t=10, requires 400 tokens out of 500.
+	// Cannot fit because 200 + 401 = 601 > 500!
+	rLarge := sim.NewRequest("r-large", "tenant-large", 400, 10, 0, 10)
+
+	// Stream of small requests (each needing 100 tokens).
+	// Arrive at t=20, 40, 60...
+	// While rBase runs, free KV is 300.
+	// rLarge (needs 400) CANNOT fit, but small requests (need 100) fit and admit immediately!
+	var trace []*sim.Request
+	trace = append(trace, rBase, rLarge)
+	for i := 0; i < 5; i++ {
+		rSmall := sim.NewRequest(fmt.Sprintf("r-small-%d", i), fmt.Sprintf("tenant-small-%d", i), 100, 10, 0, int64(20+i*20))
+		trace = append(trace, rSmall)
+	}
+
+	simSkip.Run(trace)
+
+	// Under Skip mode, all small requests bypass the earlier-arrived large request!
+	for i := 0; i < 5; i++ {
+		smallReq := trace[2+i]
+		if smallReq.DispatchedTime() >= rLarge.DispatchedTime() {
+			t.Fatalf("expected small request %s (dispatched at %d) to bypass large request (dispatched at %d)",
+				smallReq.ID(), smallReq.DispatchedTime(), rLarge.DispatchedTime())
+		}
+	}
+}
+
+// TestJainsDemandCappedHandComputed verifies the exact mathematical formula for time-windowed demand-capped Jain index.
+func TestJainsDemandCappedHandComputed(t *testing.T) {
+	// Case 1: Perfectly equal service and demand
+	// Both tenants demand 500, served 500. Fair share = 500. Targets = 500. x = [1.0, 1.0] -> J = 1.0
+	j1 := sim.JainsDemandCapped([]float64{500, 500}, []float64{500, 500})
+	if j1 != 1.0 {
+		t.Fatalf("expected J=1.0 for equal allocations, got %f", j1)
+	}
+
+	// Case 2: Unequal demand, demand-capped satisfied
+	// Total served = 1000, N=2 -> Fair share = 500.
+	// Tenant A demand = 200 < 500 -> Target A = 200. Served A = 200 -> x_A = 1.0.
+	// Tenant B demand = 800 > 500 -> Target B = 500. Served B = 800 -> x_B = 800/500 = 1.6.
+	// x = [1.0, 1.6]. Sum = 2.6, SumSq = 1 + 2.56 = 3.56.
+	// J = (2.6^2) / (2 * 3.56) = 6.76 / 7.12 = 0.9494382...
+	j2 := sim.JainsDemandCapped([]float64{200, 800}, []float64{200, 800})
+	expectedJ2 := 6.76 / 7.12
+	if math.Abs(j2-expectedJ2) > 1e-6 {
+		t.Fatalf("expected J=%f, got %f", expectedJ2, j2)
+	}
+
+	// Case 3: Starvation (light tenant starved below its demand)
+	// Total served = 1000, N=2 -> Fair share = 500.
+	// Tenant A demand = 200 -> Target A = 200. Served A = 50 -> x_A = 50/200 = 0.25.
+	// Tenant B demand = 800 -> Target B = 500. Served B = 950 -> x_B = 950/500 = 1.9.
+	// x = [0.25, 1.9]. Sum = 2.15, SumSq = 0.0625 + 3.61 = 3.6725.
+	// J = (2.15^2) / (2 * 3.6725) = 4.6225 / 7.345 = 0.629339...
+	j3 := sim.JainsDemandCapped([]float64{50, 950}, []float64{200, 800})
+	expectedJ3 := 4.6225 / 7.345
+	if math.Abs(j3-expectedJ3) > 1e-6 {
+		t.Fatalf("expected J=%f, got %f", expectedJ3, j3)
+	}
+}
+

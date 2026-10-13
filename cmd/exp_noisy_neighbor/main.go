@@ -17,6 +17,7 @@ import (
 
 type EnvironmentMetadata struct {
 	GitCommit     string `json:"git_commit"`
+	IsDirtyTree   bool   `json:"is_dirty_tree"`
 	OS            string `json:"os"`
 	CPU           string `json:"cpu"`
 	Cores         int    `json:"cores"`
@@ -34,8 +35,12 @@ func getEnvMetadata() EnvironmentMetadata {
 		commit = "uncommitted"
 	}
 
+	statusOut, _ := exec.Command("git", "status", "--porcelain").Output()
+	isDirty := len(strings.TrimSpace(string(statusOut))) > 0
+
 	return EnvironmentMetadata{
 		GitCommit:     commit,
+		IsDirtyTree:   isDirty,
 		OS:            "Microsoft Windows 11 Pro 10.0.26300",
 		CPU:           "AMD Ryzen 7 PRO 5850U with Radeon Graphics",
 		Cores:         8,

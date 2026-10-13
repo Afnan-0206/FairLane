@@ -1,44 +1,54 @@
-# FairLane Experiment 2: Heterogeneous Request Sizing Under Permanent Backlog
-# Thesis: When tenants have asymmetric token lengths (Chat 128 tokens vs RAG 4k tokens),
-# request-count round-robin severely starves the small tenant in token throughput.
-# Token-aware scheduling (VTC) is required to equalize token allocation.
+# FairLane Experiment 2: Steady-State Heterogeneous Sizing Under Overload
+# Topology: Two permanently backlogged tenants with heterogeneous request sizes:
+#   - Chat: prompt 128, decode 64 (raw 192 tok, weighted 256 tok with w_in=1, w_out=2)
+#   - RAG:  prompt 4000, decode 128 (raw 4128 tok, weighted 4256 tok with w_in=1, w_out=2)
+# Both tenants submit Poisson arrivals at rates exceeding their fair share of server capacity:
+#   - Chat: 50 req/s (Poisson, mean interval 20ms)
+#   - RAG:  10 req/s (Poisson, mean interval 100ms)
+# Execution runs over a fixed horizon of 60.0s, discarding a 10.0s warm-up period.
+# Service metrics are evaluated strictly within the measurement window where BOTH tenants are backlogged.
 #
 # Pre-committed Hypotheses:
-# 1. FIFO: With interleaved arrivals under permanent backlog, request dispatch follows arrival ordering.
-#    Because RAG requests are ~21.5x larger (4128 tokens vs 192 tokens), RAG will monopolize >90% of token share.
-# 2. Round-Robin: Grants exact 50% request share (1:1 alternating). Consequently, RAG captures
-#    ~4128 / (4128 + 192) = 95.5% of total tokens served, while Chat receives only ~4.5% token share.
-# 3. VTC: By tracking accumulated virtual tokens, VTC dispatches ~21.5 Chat requests for every 1 RAG request,
-#    equalizing long-run per-tenant token throughput toward 50% / 50% (+/- 5%).
+# 1. Round-Robin Hand-Calc Prediction: Under strict 1:1 request dispatch (N_chat = N_rag),
+#    Chat weighted token share is 256 / (256 + 4256) = 256 / 4512 ~ 5.67% (~5.7%).
+#    Raw token share is 192 / (192 + 4128) = 192 / 4320 ~ 4.44%.
+#    Under continuous batching, if KV capacity restricts concurrent RAG admissions, Chat may capture
+#    additional batch slots, elevating empirical share above 5.7%.
+# 2. VTC Hand-Calc Prediction: By balancing virtual token counters (c_chat ~ c_rag),
+#    VTC will schedule ~16.6 Chat requests for every 1 RAG request, targeting:
+#    Chat Weighted Token Share ~ 50.0% (+/- 5%) and RAG Weighted Token Share ~ 50.0% (+/- 5%).
+#    Chat Raw Token Share ~ (16.625 * 192) / (16.625 * 192 + 4128) = 3192 / 7320 ~ 43.6%.
+# 3. FIFO Prediction: Earliest arrivals monopolize continuous batch slots, leaving Chat with <5% token share.
 
-experiment_name: "exp_heterogeneous"
+experiment_name: "exp_heterogeneous_steady_state"
 seeds_count: 30
 seed_start: 200
 
-server:
-  kv_capacity_tokens: 16384 # Sufficient capacity to hold concurrent 4k RAG prompts
-  max_batch_size: 16
-  base_step_time_us: 5000   # 5 ms base step time
-  per_token_cost_us: 5      # 5 µs per active token
+simulation:
+  horizon_us: 60000000 # 60 seconds fixed horizon
+  warmup_us:  10000000 # 10 seconds discarded warm-up
 
-sliding_window_tokens: 2000
+server:
+  kv_capacity_tokens: 16384
+  max_batch_size: 16
+  base_step_time_us: 5000 # 5 ms base step
+  per_token_cost_us: 5    # 5 µs per token in batch
 
 workload:
-  permanent_backlog: true
   tenants:
     - tenant_id: "chat"
-      request_count: 200
-      arrival_process: "periodic"
-      mean_interval_us: 1000 # tightly packed arrivals ensuring permanent backlog
+      request_count: 2500
+      arrival_process: "poisson"
+      mean_interval_us: 20000 # 50 req/s
       prompt_length_min: 128
       prompt_length_max: 128
       output_length_min: 64
       output_length_max: 64
 
     - tenant_id: "rag"
-      request_count: 50
-      arrival_process: "periodic"
-      mean_interval_us: 4000 # tightly packed arrivals ensuring permanent backlog
+      request_count: 500
+      arrival_process: "poisson"
+      mean_interval_us: 100000 # 10 req/s
       prompt_length_min: 4000
       prompt_length_max: 4000
       output_length_min: 128

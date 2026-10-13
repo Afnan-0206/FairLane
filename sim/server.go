@@ -51,6 +51,10 @@ func (s *Server) UsedKVTokens() int {
 	return s.usedKV
 }
 
+func (s *Server) FreeKVTokens() int {
+	return s.cfg.KVCapacityTokens - s.usedKV
+}
+
 // CanAdmit checks whether a candidate request can fit into the current batch and KV cache.
 // A request requires inputTokens + 1 (first decode token) of KV space to be admitted.
 func (s *Server) CanAdmit(req policy.RequestView) bool {
@@ -78,9 +82,11 @@ func (s *Server) Admit(req *Request, pol policy.Policy, nowUs int64) {
 
 // StepResult summarizes the execution of one continuous batching step.
 type StepResult struct {
-	StepDurationUs int64
-	TokensInStep   int
-	Completed      []*Request
+	StepDurationUs          int64
+	TokensInStep            int
+	TokensPerTenant         map[string]int
+	WeightedTokensPerTenant map[string]float64
+	Completed               []*Request
 }
 
 // Step advances execution by one continuous batching step.
@@ -92,6 +98,8 @@ func (s *Server) Step(pol policy.Policy, nowUs int64) StepResult {
 	}
 
 	tokensInStep := 0
+	tokensPerTenant := make(map[string]int)
+	weightedTokensPerTenant := make(map[string]float64)
 	var completed []*Request
 	var remaining []*RunningRequest
 
@@ -99,8 +107,12 @@ func (s *Server) Step(pol policy.Policy, nowUs int64) StepResult {
 	for _, r := range s.running {
 		if r.isPrefill {
 			tokensInStep += r.req.inputTokens
+			tokensPerTenant[r.req.tenantID] += r.req.inputTokens
+			weightedTokensPerTenant[r.req.tenantID] += float64(r.req.inputTokens) * 1.0
 		} else {
 			tokensInStep += 1
+			tokensPerTenant[r.req.tenantID] += 1
+			weightedTokensPerTenant[r.req.tenantID] += 2.0
 		}
 	}
 
@@ -153,8 +165,10 @@ func (s *Server) Step(pol policy.Policy, nowUs int64) StepResult {
 
 	s.running = remaining
 	return StepResult{
-		StepDurationUs: stepDuration,
-		TokensInStep:   tokensInStep,
-		Completed:      completed,
+		StepDurationUs:          stepDuration,
+		TokensInStep:            tokensInStep,
+		TokensPerTenant:         tokensPerTenant,
+		WeightedTokensPerTenant: weightedTokensPerTenant,
+		Completed:               completed,
 	}
 }

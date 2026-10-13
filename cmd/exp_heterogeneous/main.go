@@ -17,6 +17,7 @@ import (
 
 type EnvironmentMetadata struct {
 	GitCommit     string `json:"git_commit"`
+	IsDirtyTree   bool   `json:"is_dirty_tree"`
 	OS            string `json:"os"`
 	CPU           string `json:"cpu"`
 	Cores         int    `json:"cores"`
@@ -34,8 +35,12 @@ func getEnvMetadata() EnvironmentMetadata {
 		commit = "uncommitted"
 	}
 
+	statusOut, _ := exec.Command("git", "status", "--porcelain").Output()
+	isDirty := len(strings.TrimSpace(string(statusOut))) > 0
+
 	return EnvironmentMetadata{
 		GitCommit:     commit,
+		IsDirtyTree:   isDirty,
 		OS:            "Microsoft Windows 11 Pro 10.0.26300",
 		CPU:           "AMD Ryzen 7 PRO 5850U with Radeon Graphics",
 		Cores:         8,
@@ -132,18 +137,19 @@ func computeSummary(values []float64) SummaryStats {
 }
 
 type Exp2PolicyResult struct {
-	PolicyName         string       `json:"policy_name"`
-	ChatTokenShare     SummaryStats `json:"chat_token_share"`
-	RAGTokenShare      SummaryStats `json:"rag_token_share"`
-	ChatRequestShare   SummaryStats `json:"chat_request_share"`
-	RAGRequestShare    SummaryStats `json:"rag_request_share"`
-	ChatTTFTMeanMs     SummaryStats `json:"chat_ttft_mean_ms"`
-	ChatTTFTP95Ms      SummaryStats `json:"chat_ttft_p95_ms"`
-	RAGTTFTMeanMs      SummaryStats `json:"rag_ttft_mean_ms"`
-	RAGTTFTP95Ms       SummaryStats `json:"rag_ttft_p95_ms"`
-	JainsIndexSliding  SummaryStats `json:"jains_index_sliding"`
-	TotalTokensServed  int          `json:"total_tokens_served"`
-	SimulatedDurationS float64      `json:"simulated_duration_s"`
+	PolicyName           string       `json:"policy_name"`
+	ChatRawTokenShare    SummaryStats `json:"chat_raw_token_share"`
+	RAGRawTokenShare     SummaryStats `json:"rag_raw_token_share"`
+	ChatWeightedShare    SummaryStats `json:"chat_weighted_token_share"`
+	RAGWeightedShare     SummaryStats `json:"rag_weighted_token_share"`
+	ChatRequestShare     SummaryStats `json:"chat_request_share"`
+	RAGRequestShare      SummaryStats `json:"rag_request_share"`
+	ChatTTFTMeanMs       SummaryStats `json:"chat_ttft_mean_ms"`
+	ChatTTFTP95Ms        SummaryStats `json:"chat_ttft_p95_ms"`
+	RAGTTFTMeanMs        SummaryStats `json:"rag_ttft_mean_ms"`
+	RAGTTFTP95Ms         SummaryStats `json:"rag_ttft_p95_ms"`
+	BothBackloggedSteps  SummaryStats `json:"both_backlogged_steps"`
+	TotalWindowRawTokens SummaryStats `json:"total_window_raw_tokens"`
 }
 
 type Exp2SummaryFile struct {
@@ -156,10 +162,12 @@ func main() {
 	const (
 		numSeeds        = 30
 		seedStart int64 = 200
+		warmupUs  int64 = 10000000 // 10.0s warmup
+		horizonUs int64 = 60000000 // 60.0s fixed horizon
 	)
 
 	serverCfg := sim.ServerConfig{
-		KVCapacityTokens: 16384, // 16k KV to accommodate 4k RAG prompts alongside chat
+		KVCapacityTokens: 16384,
 		MaxBatchSize:     16,
 		BaseStepTimeUs:   5000,
 		PerTokenCostUs:   5,
@@ -167,9 +175,9 @@ func main() {
 
 	chatCfg := sim.TenantWorkloadConfig{
 		TenantID:        "chat",
-		RequestCount:    200,
-		ArrivalProcess:  "periodic",
-		MeanIntervalUs:  1000, // all 200 requests arrive within 200ms -> permanent backlog
+		RequestCount:    2500,
+		ArrivalProcess:  "poisson",
+		MeanIntervalUs:  20000, // 50 req/s -> heavy backlog
 		PromptLengthMin: 128,
 		PromptLengthMax: 128,
 		OutputLengthMin: 64,
@@ -178,9 +186,9 @@ func main() {
 
 	ragCfg := sim.TenantWorkloadConfig{
 		TenantID:        "rag",
-		RequestCount:    50,
-		ArrivalProcess:  "periodic",
-		MeanIntervalUs:  4000, // all 50 requests arrive within 200ms -> permanent backlog
+		RequestCount:    500,
+		ArrivalProcess:  "poisson",
+		MeanIntervalUs:  100000, // 10 req/s -> heavy backlog
 		PromptLengthMin: 4000,
 		PromptLengthMax: 4000,
 		OutputLengthMin: 128,
@@ -197,17 +205,18 @@ func main() {
 	}
 
 	policyRuns := make(map[string][]struct {
-		chatTokShare float64
-		ragTokShare  float64
-		chatReqShare float64
-		ragReqShare  float64
-		chatTTFTMean float64
-		chatTTFTP95  float64
-		ragTTFTMean  float64
-		ragTTFTP95   float64
-		jains        float64
-		totalTokens  int
-		durationS    float64
+		chatRawShare    float64
+		ragRawShare     float64
+		chatWeighted    float64
+		ragWeighted     float64
+		chatReqShare    float64
+		ragReqShare     float64
+		chatTTFTMean    float64
+		chatTTFTP95     float64
+		ragTTFTMean     float64
+		ragTTFTP95      float64
+		backloggedSteps float64
+		totalRawTokens  float64
 	})
 
 	for s := int64(0); s < numSeeds; s++ {
@@ -217,44 +226,133 @@ func main() {
 
 		for _, p := range policies {
 			pol := p.fn()
-			simulator := sim.NewSimulator(serverCfg, pol, 2000)
-			met := simulator.Run(trace)
+			qm := sim.NewTenantQueueManager()
+			server := sim.NewServer(serverCfg)
 
-			chatMet := met.PerTenant["chat"]
-			ragMet := met.PerTenant["rag"]
+			var nowUs int64 = 0
+			traceIdx := 0
 
-			totalTok := float64(chatMet.TotalTokensServed + ragMet.TotalTokensServed)
-			totalReq := float64(chatMet.RequestsCompleted + ragMet.RequestsCompleted)
+			var rawChat, rawRAG int
+			var weightedChat, weightedRAG float64
+			var compChat, compRAG int
+			bothSteps := 0
 
-			chatTokShare := float64(chatMet.TotalTokensServed) / totalTok
-			ragTokShare := float64(ragMet.TotalTokensServed) / totalTok
-			chatReqShare := float64(chatMet.RequestsCompleted) / totalReq
-			ragReqShare := float64(ragMet.RequestsCompleted) / totalReq
+			var chatTTFTs, ragTTFTs []int64
+
+			for (nowUs < horizonUs) && (traceIdx < len(trace) || qm.TotalQueuedRequests() > 0 || server.RunningCount() > 0) {
+				for traceIdx < len(trace) && trace[traceIdx].ArrivalTime() <= nowUs {
+					qm.Enqueue(trace[traceIdx], pol, serverCfg.KVCapacityTokens)
+					traceIdx++
+				}
+				qm.SetCurrentTime(nowUs)
+
+				for server.RunningCount() < serverCfg.MaxBatchSize && qm.TotalQueuedRequests() > 0 {
+					winner := pol.Pick(qm)
+					if winner == "" {
+						break
+					}
+					head, ok := qm.HeadRequest(winner)
+					if !ok || head == nil {
+						break
+					}
+					if server.CanAdmit(head) {
+						req := qm.PopHead(winner)
+						server.Admit(req, pol, nowUs)
+					} else {
+						// Break on no fit (default)
+						break
+					}
+				}
+
+				bothBacklogged := qm.QueueDepth("chat") > 0 && qm.QueueDepth("rag") > 0
+
+				if server.RunningCount() > 0 {
+					res := server.Step(pol, nowUs)
+					nowUs += res.StepDurationUs
+
+					for _, comp := range res.Completed {
+						ttft := comp.TTFT()
+						if comp.TenantID() == "chat" {
+							chatTTFTs = append(chatTTFTs, ttft)
+						} else {
+							ragTTFTs = append(ragTTFTs, ttft)
+						}
+					}
+
+					// Measurement window: discard warm-up and condition on BOTH backlogged
+					if nowUs >= warmupUs && nowUs < horizonUs && bothBacklogged {
+						bothSteps++
+						rawChat += res.TokensPerTenant["chat"]
+						rawRAG += res.TokensPerTenant["rag"]
+						weightedChat += res.WeightedTokensPerTenant["chat"]
+						weightedRAG += res.WeightedTokensPerTenant["rag"]
+
+						for _, comp := range res.Completed {
+							if comp.TenantID() == "chat" {
+								compChat++
+							} else {
+								compRAG++
+							}
+						}
+					}
+				} else {
+					if qm.TotalQueuedRequests() > 0 {
+						nowUs += 1000
+					} else if traceIdx < len(trace) {
+						nowUs = trace[traceIdx].ArrivalTime()
+					} else {
+						break
+					}
+				}
+			}
+
+			totalRaw := float64(rawChat + rawRAG)
+			totalWeighted := weightedChat + weightedRAG
+			totalReqs := float64(compChat + compRAG)
+
+			var cRawShare, rRawShare, cWShare, rWShare, cReqShare, rReqShare float64
+			if totalRaw > 0 {
+				cRawShare = float64(rawChat) / totalRaw
+				rRawShare = float64(rawRAG) / totalRaw
+			}
+			if totalWeighted > 0 {
+				cWShare = weightedChat / totalWeighted
+				rWShare = weightedRAG / totalWeighted
+			}
+			if totalReqs > 0 {
+				cReqShare = float64(compChat) / totalReqs
+				rReqShare = float64(compRAG) / totalReqs
+			}
+
+			cPerc := sim.CalculatePercentiles(chatTTFTs)
+			rPerc := sim.CalculatePercentiles(ragTTFTs)
 
 			policyRuns[p.name] = append(policyRuns[p.name], struct {
-				chatTokShare float64
-				ragTokShare  float64
-				chatReqShare float64
-				ragReqShare  float64
-				chatTTFTMean float64
-				chatTTFTP95  float64
-				ragTTFTMean  float64
-				ragTTFTP95   float64
-				jains        float64
-				totalTokens  int
-				durationS    float64
+				chatRawShare    float64
+				ragRawShare     float64
+				chatWeighted    float64
+				ragWeighted     float64
+				chatReqShare    float64
+				ragReqShare     float64
+				chatTTFTMean    float64
+				chatTTFTP95     float64
+				ragTTFTMean     float64
+				ragTTFTP95      float64
+				backloggedSteps float64
+				totalRawTokens  float64
 			}{
-				chatTokShare: chatTokShare,
-				ragTokShare:  ragTokShare,
-				chatReqShare: chatReqShare,
-				ragReqShare:  ragReqShare,
-				chatTTFTMean: chatMet.TTFTUs.Mean / 1000.0,
-				chatTTFTP95:  chatMet.TTFTUs.P95 / 1000.0,
-				ragTTFTMean:  ragMet.TTFTUs.Mean / 1000.0,
-				ragTTFTP95:   ragMet.TTFTUs.P95 / 1000.0,
-				jains:        met.JainsIndexSliding,
-				totalTokens:  met.TotalTokensServed,
-				durationS:    float64(met.TotalVirtualTimeUs) / 1e6,
+				chatRawShare:    cRawShare,
+				ragRawShare:     rRawShare,
+				chatWeighted:    cWShare,
+				ragWeighted:     rWShare,
+				chatReqShare:    cReqShare,
+				ragReqShare:     rReqShare,
+				chatTTFTMean:    cPerc.Mean / 1000.0,
+				chatTTFTP95:     cPerc.P95 / 1000.0,
+				ragTTFTMean:     rPerc.Mean / 1000.0,
+				ragTTFTP95:      rPerc.P95 / 1000.0,
+				backloggedSteps: float64(bothSteps),
+				totalRawTokens:  totalRaw,
 			})
 		}
 	}
@@ -262,41 +360,48 @@ func main() {
 	var results []Exp2PolicyResult
 	for _, p := range policies {
 		runs := policyRuns[p.name]
-		cToks := make([]float64, len(runs))
-		rToks := make([]float64, len(runs))
+		cRaws := make([]float64, len(runs))
+		rRaws := make([]float64, len(runs))
+		cWeights := make([]float64, len(runs))
+		rWeights := make([]float64, len(runs))
 		cReqs := make([]float64, len(runs))
 		rReqs := make([]float64, len(runs))
 		cTTFTMeans := make([]float64, len(runs))
 		cTTFTP95s := make([]float64, len(runs))
 		rTTFTMeans := make([]float64, len(runs))
 		rTTFTP95s := make([]float64, len(runs))
-		jains := make([]float64, len(runs))
+		steps := make([]float64, len(runs))
+		tokens := make([]float64, len(runs))
 
 		for i, r := range runs {
-			cToks[i] = r.chatTokShare
-			rToks[i] = r.ragTokShare
+			cRaws[i] = r.chatRawShare
+			rRaws[i] = r.ragRawShare
+			cWeights[i] = r.chatWeighted
+			rWeights[i] = r.ragWeighted
 			cReqs[i] = r.chatReqShare
 			rReqs[i] = r.ragReqShare
 			cTTFTMeans[i] = r.chatTTFTMean
 			cTTFTP95s[i] = r.chatTTFTP95
 			rTTFTMeans[i] = r.ragTTFTMean
 			rTTFTP95s[i] = r.ragTTFTP95
-			jains[i] = r.jains
+			steps[i] = r.backloggedSteps
+			tokens[i] = r.totalRawTokens
 		}
 
 		res := Exp2PolicyResult{
-			PolicyName:         p.name,
-			ChatTokenShare:     computeSummary(cToks),
-			RAGTokenShare:      computeSummary(rToks),
-			ChatRequestShare:   computeSummary(cReqs),
-			RAGRequestShare:    computeSummary(rReqs),
-			ChatTTFTMeanMs:     computeSummary(cTTFTMeans),
-			ChatTTFTP95Ms:      computeSummary(cTTFTP95s),
-			RAGTTFTMeanMs:      computeSummary(rTTFTMeans),
-			RAGTTFTP95Ms:       computeSummary(rTTFTP95s),
-			JainsIndexSliding:  computeSummary(jains),
-			TotalTokensServed:  runs[0].totalTokens,
-			SimulatedDurationS: runs[0].durationS,
+			PolicyName:           p.name,
+			ChatRawTokenShare:    computeSummary(cRaws),
+			RAGRawTokenShare:     computeSummary(rRaws),
+			ChatWeightedShare:    computeSummary(cWeights),
+			RAGWeightedShare:     computeSummary(rWeights),
+			ChatRequestShare:     computeSummary(cReqs),
+			RAGRequestShare:      computeSummary(rReqs),
+			ChatTTFTMeanMs:       computeSummary(cTTFTMeans),
+			ChatTTFTP95Ms:        computeSummary(cTTFTP95s),
+			RAGTTFTMeanMs:        computeSummary(rTTFTMeans),
+			RAGTTFTP95Ms:         computeSummary(rTTFTP95s),
+			BothBackloggedSteps:  computeSummary(steps),
+			TotalWindowRawTokens: computeSummary(tokens),
 		}
 		results = append(results, res)
 	}
@@ -305,7 +410,7 @@ func main() {
 	_ = os.MkdirAll(outDir, 0755)
 
 	sumFile := Exp2SummaryFile{
-		Experiment:  "exp_heterogeneous",
+		Experiment:  "exp_heterogeneous_steady_state",
 		Environment: getEnvMetadata(),
 		Policies:    results,
 	}
@@ -314,29 +419,49 @@ func main() {
 	_ = os.WriteFile(filepath.Join(outDir, "exp_heterogeneous_summary.json"), jsonBytes, 0644)
 
 	// Print Markdown Table
-	fmt.Printf("\n=== EXPERIMENT 2: HETEROGENEOUS REQUEST SIZING (N=30 seeds, 95%% CI) ===\n")
-	fmt.Printf("| %-14s | %-24s | %-24s | %-16s |\n",
-		"Policy", "Chat Token Share (%)", "RAG Token Share (%)", "Jain's Index")
-	fmt.Printf("|----------------|--------------------------|--------------------------|------------------|\n")
+	fmt.Printf("\n=== EXPERIMENT 2: STEADY-STATE TOKEN SHARES (N=%d seeds, 95%% CI) ===\n", numSeeds)
+	fmt.Printf("Window: [10.0s, 60.0s], conditioned on BOTH queues backlogged\n")
+	fmt.Printf("| %-14s | %-26s | %-26s |\n",
+		"Policy", "Chat Weighted Share (w=1,2)", "Chat Raw Token Share")
+	fmt.Printf("|----------------|----------------------------|----------------------------|\n")
 
 	for _, r := range results {
-		fmt.Printf("| %-14s | %5.1f%% [%4.1f%%, %4.1f%%]  | %5.1f%% [%4.1f%%, %4.1f%%]  | %5.3f [%4.3f, %4.3f] |\n",
+		fmt.Printf("| %-14s | %5.1f%% [%4.1f%%, %4.1f%%]    | %5.1f%% [%4.1f%%, %4.1f%%]    |\n",
 			r.PolicyName,
-			r.ChatTokenShare.Mean*100, r.ChatTokenShare.CI95Low*100, r.ChatTokenShare.CI95Hi*100,
-			r.RAGTokenShare.Mean*100, r.RAGTokenShare.CI95Low*100, r.RAGTokenShare.CI95Hi*100,
-			r.JainsIndexSliding.Mean, r.JainsIndexSliding.CI95Low, r.JainsIndexSliding.CI95Hi,
+			r.ChatWeightedShare.Mean*100, r.ChatWeightedShare.CI95Low*100, r.ChatWeightedShare.CI95Hi*100,
+			r.ChatRawTokenShare.Mean*100, r.ChatRawTokenShare.CI95Low*100, r.ChatRawTokenShare.CI95Hi*100,
 		)
 	}
 
-	fmt.Printf("\nPer-Tenant Request Shares and Latencies:\n")
-	fmt.Printf("| %-14s | %-16s | %-16s | %-18s | %-18s |\n",
-		"Policy", "Chat Req Share", "RAG Req Share", "Chat TTFT Mean (ms)", "Chat TTFT P95 (ms)")
-	fmt.Printf("|----------------|------------------|------------------|--------------------|--------------------|\n")
+	fmt.Printf("\nComparison with Hand-Calculated Predictions:\n")
+	fmt.Printf("| %-14s | %-16s | %-16s | %-16s | %-16s |\n",
+		"Policy", "Hand-Calc Wtd", "Measured Wtd CI", "Hand-Calc Raw", "Measured Raw CI")
+	fmt.Printf("|----------------|------------------|------------------|------------------|------------------|\n")
+	fmt.Printf("| %-14s | ~0.0%% - 5.0%%   | %5.1f%% [%4.1f-%4.1f] | <5.0%%           | %5.1f%% [%4.1f-%4.1f] |\n",
+		"fifo",
+		results[0].ChatWeightedShare.Mean*100, results[0].ChatWeightedShare.CI95Low*100, results[0].ChatWeightedShare.CI95Hi*100,
+		results[0].ChatRawTokenShare.Mean*100, results[0].ChatRawTokenShare.CI95Low*100, results[0].ChatRawTokenShare.CI95Hi*100,
+	)
+	fmt.Printf("| %-14s | ~5.7%% (1:1 req) | %5.1f%% [%4.1f-%4.1f] | ~4.4%% (1:1 req) | %5.1f%% [%4.1f-%4.1f] |\n",
+		"round-robin",
+		results[1].ChatWeightedShare.Mean*100, results[1].ChatWeightedShare.CI95Low*100, results[1].ChatWeightedShare.CI95Hi*100,
+		results[1].ChatRawTokenShare.Mean*100, results[1].ChatRawTokenShare.CI95Low*100, results[1].ChatRawTokenShare.CI95Hi*100,
+	)
+	fmt.Printf("| %-14s | ~50.0%%          | %5.1f%% [%4.1f-%4.1f] | ~43.6%%          | %5.1f%% [%4.1f-%4.1f] |\n",
+		"vtc",
+		results[2].ChatWeightedShare.Mean*100, results[2].ChatWeightedShare.CI95Low*100, results[2].ChatWeightedShare.CI95Hi*100,
+		results[2].ChatRawTokenShare.Mean*100, results[2].ChatRawTokenShare.CI95Low*100, results[2].ChatRawTokenShare.CI95Hi*100,
+	)
+
+	fmt.Printf("\nTTFT Performance (Mean / P95):\n")
+	fmt.Printf("| %-14s | %-22s | %-22s |\n",
+		"Policy", "Chat TTFT (Mean / P95)", "RAG TTFT (Mean / P95)")
+	fmt.Printf("|----------------|------------------------|------------------------|\n")
 	for _, r := range results {
-		fmt.Printf("| %-14s | %5.1f%%           | %5.1f%%           | %7.1f ms          | %7.1f ms          |\n",
+		fmt.Printf("| %-14s | %6.1f ms / %6.1f ms   | %6.1f ms / %6.1f ms   |\n",
 			r.PolicyName,
-			r.ChatRequestShare.Mean*100, r.RAGRequestShare.Mean*100,
 			r.ChatTTFTMeanMs.Mean, r.ChatTTFTP95Ms.Mean,
+			r.RAGTTFTMeanMs.Mean, r.RAGTTFTP95Ms.Mean,
 		)
 	}
 }

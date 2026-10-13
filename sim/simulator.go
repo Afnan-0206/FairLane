@@ -6,11 +6,37 @@ import (
 	"fairlane/policy"
 )
 
+// AdmissionMode defines whether non-fitting head requests block batch formation or are skipped.
+type AdmissionMode int
+
+const (
+	// AdmissionModeBreak halts batch formation when the winner's head request cannot fit into the available KV cache.
+	// This preserves strict order and prevents large-request starvation (Default).
+	AdmissionModeBreak AdmissionMode = iota
+
+	// AdmissionModeSkip bypasses a winner whose head request cannot fit, evaluating other backlogged tenants.
+	// Can cause large-request starvation under continuous small-request load.
+	AdmissionModeSkip
+)
+
+func (m AdmissionMode) String() string {
+	switch m {
+	case AdmissionModeBreak:
+		return "break"
+	case AdmissionModeSkip:
+		return "skip"
+	default:
+		return "unknown"
+	}
+}
+
 // Simulator drives the discrete-event execution of workload traces through a fairness policy.
 type Simulator struct {
 	server       *Server
 	queueManager *TenantQueueManager
 	policy       policy.Policy
+
+	admissionMode AdmissionMode
 
 	slidingWindowTokens int
 	windowAllocations   []map[string]float64 // historical token allocations per token window
@@ -33,16 +59,56 @@ func NewSimulator(serverCfg ServerConfig, pol policy.Policy, slidingWindowTokens
 		server:              NewServer(serverCfg),
 		queueManager:        NewTenantQueueManager(),
 		policy:              pol,
+		admissionMode:       AdmissionModeBreak, // Default is break-on-no-fit
 		slidingWindowTokens: slidingWindowTokens,
 		timeWindowUs:        500000, // 500ms time window
 		submittedCount:      make(map[string]int),
 	}
 }
 
+func (s *Simulator) SetAdmissionMode(mode AdmissionMode) {
+	s.admissionMode = mode
+}
+
+func (s *Simulator) AdmissionMode() AdmissionMode {
+	return s.admissionMode
+}
+
 func (s *Simulator) SetTimeWindowUs(winUs int64) {
 	if winUs > 0 {
 		s.timeWindowUs = winUs
 	}
+}
+
+// filteredSchedulerView filters out temporarily skipped tenants for AdmissionModeSkip.
+type filteredSchedulerView struct {
+	base    policy.SchedulerView
+	skipped map[string]bool
+}
+
+func newFilteredSchedulerView(base policy.SchedulerView, skipped map[string]bool) *filteredSchedulerView {
+	return &filteredSchedulerView{base: base, skipped: skipped}
+}
+
+func (v *filteredSchedulerView) BackloggedTenants() []string {
+	var res []string
+	for _, t := range v.base.BackloggedTenants() {
+		if !v.skipped[t] {
+			res = append(res, t)
+		}
+	}
+	return res
+}
+
+func (v *filteredSchedulerView) HeadRequest(tenantID string) (policy.RequestView, bool) {
+	if v.skipped[tenantID] {
+		return nil, false
+	}
+	return v.base.HeadRequest(tenantID)
+}
+
+func (v *filteredSchedulerView) CurrentTime() int64 {
+	return v.base.CurrentTime()
 }
 
 // Run executes the simulation until all requests in the trace complete.
@@ -83,25 +149,57 @@ func (s *Simulator) Run(trace []*Request) SimulationMetrics {
 		s.queueManager.SetCurrentTime(nowUs)
 
 		// 2. Batch formation: Admit eligible requests using policy.Pick
-		for s.server.RunningCount() < s.server.cfg.MaxBatchSize && s.queueManager.TotalQueuedRequests() > 0 {
-			winnerTenant := s.policy.Pick(s.queueManager)
-			if winnerTenant == "" {
-				break
-			}
+		if s.admissionMode == AdmissionModeBreak {
+			for s.server.RunningCount() < s.server.cfg.MaxBatchSize && s.queueManager.TotalQueuedRequests() > 0 {
+				winnerTenant := s.policy.Pick(s.queueManager)
+				if winnerTenant == "" {
+					break
+				}
 
-			headReq, ok := s.queueManager.HeadRequest(winnerTenant)
-			if !ok || headReq == nil {
-				break
-			}
+				headReq, ok := s.queueManager.HeadRequest(winnerTenant)
+				if !ok || headReq == nil {
+					break
+				}
 
-			if s.server.CanAdmit(headReq) {
-				req := s.queueManager.PopHead(winnerTenant)
-				s.server.Admit(req, s.policy, nowUs)
-			} else {
-				// BREAK-ON-NO-FIT (Amendment 4):
-				// Strict work-conserving order: if the head request of the selected tenant
-				// cannot fit into available KV cache right now, break out of batch formation.
-				break
+				if s.server.CanAdmit(headReq) {
+					req := s.queueManager.PopHead(winnerTenant)
+					s.server.Admit(req, s.policy, nowUs)
+				} else {
+					// BREAK-ON-NO-FIT (Default):
+					// Strict work-conserving order: if the head request of the selected tenant
+					// cannot fit into available KV cache right now, break out of batch formation.
+					break
+				}
+			}
+		} else {
+			// AdmissionModeSkip:
+			// If a winning tenant's head request cannot fit, temporarily skip it in this batch formation round
+			// and pick from the remaining backlogged tenants.
+			skipped := make(map[string]bool)
+			for s.server.RunningCount() < s.server.cfg.MaxBatchSize {
+				filteredView := newFilteredSchedulerView(s.queueManager, skipped)
+				if len(filteredView.BackloggedTenants()) == 0 {
+					break
+				}
+
+				winnerTenant := s.policy.Pick(filteredView)
+				if winnerTenant == "" {
+					break
+				}
+
+				headReq, ok := s.queueManager.HeadRequest(winnerTenant)
+				if !ok || headReq == nil {
+					skipped[winnerTenant] = true
+					continue
+				}
+
+				if s.server.CanAdmit(headReq) {
+					req := s.queueManager.PopHead(winnerTenant)
+					s.server.Admit(req, s.policy, nowUs)
+				} else {
+					// Cannot fit: skip this tenant for this admission round
+					skipped[winnerTenant] = true
+				}
 			}
 		}
 
