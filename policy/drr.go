@@ -7,6 +7,8 @@ import (
 // DRRConfig configures Deficit Round Robin scheduling.
 type DRRConfig struct {
 	BaseQuantumTokens int                // Base token quantum Q_0 (default: 512)
+	InputWeight       float64            // w_in (default: 1.0)
+	OutputWeight      float64            // w_out (default: 2.0)
 	TenantWeights     map[string]float64 // Tenant weights w_i (default: 1.0)
 	UsePredictedCost  bool               // If true, uses inputTokens + predictedOutput; if false, uses inputTokens
 }
@@ -15,8 +17,10 @@ type DRRConfig struct {
 func DefaultDRRConfig() DRRConfig {
 	return DRRConfig{
 		BaseQuantumTokens: 512,
+		InputWeight:       1.0,
+		OutputWeight:      2.0,
 		TenantWeights:     make(map[string]float64),
-		UsePredictedCost:  false,
+		UsePredictedCost:  true,
 	}
 }
 
@@ -24,7 +28,7 @@ func DefaultDRRConfig() DRRConfig {
 type DRR struct {
 	mu            sync.Mutex
 	cfg           DRRConfig
-	deficits      map[string]int
+	deficits      map[string]float64
 	currentTenant string
 }
 
@@ -32,12 +36,18 @@ func NewDRR(cfg DRRConfig) *DRR {
 	if cfg.BaseQuantumTokens <= 0 {
 		cfg.BaseQuantumTokens = 512
 	}
+	if cfg.InputWeight <= 0 {
+		cfg.InputWeight = 1.0
+	}
+	if cfg.OutputWeight <= 0 {
+		cfg.OutputWeight = 2.0
+	}
 	if cfg.TenantWeights == nil {
 		cfg.TenantWeights = make(map[string]float64)
 	}
 	return &DRR{
 		cfg:      cfg,
-		deficits: make(map[string]int),
+		deficits: make(map[string]float64),
 	}
 }
 
@@ -45,35 +55,44 @@ func (p *DRR) Name() string {
 	return "drr"
 }
 
-func (p *DRR) Deficits() map[string]int {
+func (p *DRR) Deficits() map[string]float64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	res := make(map[string]int, len(p.deficits))
+	res := make(map[string]float64, len(p.deficits))
 	for k, v := range p.deficits {
 		res[k] = v
 	}
 	return res
 }
 
-func (p *DRR) quantum(tenantID string) int {
+func (p *DRR) quantum(tenantID string) float64 {
 	w := 1.0
 	if val, ok := p.cfg.TenantWeights[tenantID]; ok && val > 0 {
 		w = val
 	}
-	q := int(float64(p.cfg.BaseQuantumTokens) * w)
-	if q < 1 {
-		q = 1
+	q := float64(p.cfg.BaseQuantumTokens) * w
+	if q < 1.0 {
+		q = 1.0
 	}
 	return q
 }
 
-func (p *DRR) cost(req RequestView) int {
-	cost := req.InputTokens()
-	if p.cfg.UsePredictedCost && req.PredictedOutputTokens() > 0 {
-		cost += req.PredictedOutputTokens()
+func (p *DRR) cost(req RequestView) float64 {
+	wIn := p.cfg.InputWeight
+	if wIn <= 0 {
+		wIn = 1.0
 	}
-	if cost < 1 {
-		cost = 1
+	wOut := p.cfg.OutputWeight
+	if wOut <= 0 {
+		wOut = 2.0
+	}
+
+	cost := wIn * float64(req.InputTokens())
+	if p.cfg.UsePredictedCost && req.PredictedOutputTokens() > 0 {
+		cost += wOut * float64(req.PredictedOutputTokens())
+	}
+	if cost < 1.0 {
+		cost = 1.0
 	}
 	return cost
 }
@@ -88,9 +107,10 @@ func (p *DRR) Pick(view SchedulerView) string {
 		return ""
 	}
 
-	// Reset deficits for tenants that have no queued requests
-	for t := range p.deficits {
-		if _, ok := view.HeadRequest(t); !ok {
+	// Reset positive accumulated deficits for tenants that have no queued requests.
+	// Negative deficits (debt from underprediction corrections) are preserved.
+	for t, d := range p.deficits {
+		if _, ok := view.HeadRequest(t); !ok && d > 0 {
 			delete(p.deficits, t)
 		}
 	}
@@ -154,9 +174,6 @@ func (p *DRR) OnDispatch(req RequestView) {
 	t := req.TenantID()
 	reqCost := p.cost(req)
 	p.deficits[t] -= reqCost
-	if p.deficits[t] < 0 {
-		p.deficits[t] = 0
-	}
 	p.currentTenant = t
 }
 
@@ -164,9 +181,27 @@ func (p *DRR) OnArrival(req RequestView, queueWasEmpty bool, lastDepartedTenant 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if queueWasEmpty {
-		p.deficits[req.TenantID()] = 0
+		if p.deficits[req.TenantID()] > 0 {
+			p.deficits[req.TenantID()] = 0
+		}
 	}
 }
 
-func (p *DRR) OnTokens(tenantID string, inputTokens, outputTokens int)                  {}
-func (p *DRR) OnComplete(tenantID string, req RequestView, totalInput, totalOutput int) {}
+func (p *DRR) OnTokens(tenantID string, inputTokens, outputTokens int) {}
+
+func (p *DRR) OnComplete(tenantID string, req RequestView, totalInput, totalOutput int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	wOut := p.cfg.OutputWeight
+	if wOut <= 0 {
+		wOut = 2.0
+	}
+	predOut := 0
+	if req != nil {
+		predOut = req.PredictedOutputTokens()
+	}
+	diff := totalOutput - predOut
+	delta := wOut * float64(diff)
+	p.deficits[tenantID] -= delta
+}

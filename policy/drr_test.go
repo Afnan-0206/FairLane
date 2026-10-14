@@ -113,3 +113,45 @@ func TestDRRWeightedOracle(t *testing.T) {
 		t.Fatalf("Expected 4 serves for A and 2 serves for B (2:1 ratio), got A=%d, B=%d", servesA, servesB)
 	}
 }
+
+// TestDRRCompletionCorrection tests that underpredicted output tokens are charged upon completion.
+func TestDRRCompletionCorrection(t *testing.T) {
+	cfg := policy.DRRConfig{
+		BaseQuantumTokens: 500,
+		InputWeight:       1.0,
+		OutputWeight:      2.0,
+		UsePredictedCost:  true,
+	}
+	drr := policy.NewDRR(cfg)
+
+	req := &mockRequest{
+		id:        "req-1",
+		tenantID:  "tenant-a",
+		input:     100,
+		predOut:   50, // predicted cost = 100 + 2*50 = 200
+		arrivalUs: 0,
+	}
+
+	heads := map[string]policy.RequestView{"tenant-a": req}
+	view := newMockView(heads, 100)
+
+	winner := drr.Pick(view)
+	if winner != "tenant-a" {
+		t.Fatalf("Expected tenant-a to be picked, got %s", winner)
+	}
+
+	drr.OnDispatch(req)
+	// Deficit should be 500 - 200 = 300
+	deficits := drr.Deficits()
+	if deficits["tenant-a"] != 300.0 {
+		t.Fatalf("Expected deficit 300 after dispatch, got %f", deficits["tenant-a"])
+	}
+
+	// Request completes with actual output 150 (diff = +100 tokens, weighted delta = +200)
+	drr.OnComplete("tenant-a", req, 100, 150)
+	deficits = drr.Deficits()
+	if deficits["tenant-a"] != 100.0 {
+		t.Fatalf("Expected deficit 100 after completion correction, got %f", deficits["tenant-a"])
+	}
+}
+
