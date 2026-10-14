@@ -13,147 +13,333 @@ import (
 	"fairlane/sim"
 )
 
-type SummaryResult struct {
-	Name            string             `json:"name"`
-	Category        string             `json:"category"`
-	Parameter       string             `json:"parameter"`
-	ChatRawShare    float64            `json:"chat_raw_share"`
-	ChatWtdShare    float64            `json:"chat_wtd_share"`
-	MaxMinRatio     float64            `json:"max_min_ratio"`
-	ChatTTFTMeanMs  float64            `json:"chat_ttft_mean_ms"`
-	RAGTTFTMeanMs   float64            `json:"rag_ttft_mean_ms"`
-	TotalTokens     int                `json:"total_tokens"`
-	PerTenantTokens map[string]int     `json:"per_tenant_tokens"`
+// MetricCI stores the mean and 95% confidence interval bounds [low, high].
+type MetricCI struct {
+	Mean float64 `json:"mean"`
+	Low  float64 `json:"low"`
+	High float64 `json:"high"`
+}
+
+func (m MetricCI) String() string {
+	return fmt.Sprintf("%.1f [%.1f, %.1f]", m.Mean, m.Low, m.High)
+}
+
+func (m MetricCI) StringPct() string {
+	return fmt.Sprintf("%.1f%% [%.1f%%, %.1f%%]", m.Mean*100, m.Low*100, m.High*100)
+}
+
+// calcCI computes mean and 95% Student-t confidence interval across multiple seeds.
+func calcCI(values []float64) MetricCI {
+	n := len(values)
+	if n == 0 {
+		return MetricCI{}
+	}
+	if n == 1 {
+		return MetricCI{Mean: values[0], Low: values[0], High: values[0]}
+	}
+
+	var sum float64
+	for _, v := range values {
+		sum += v
+	}
+	mean := sum / float64(n)
+
+	var sumSqDiff float64
+	for _, v := range values {
+		diff := v - mean
+		sumSqDiff += diff * diff
+	}
+	variance := sumSqDiff / float64(n-1)
+	stdErr := math.Sqrt(variance / float64(n))
+
+	// Critical value t for 95% CI:
+	// n=5 (df=4) -> 2.776
+	// n=30 (df=29) -> 2.045
+	// general default:
+	tCrit := 2.776
+	if n > 10 {
+		tCrit = 2.045
+	}
+
+	margin := tCrit * stdErr
+	return MetricCI{
+		Mean: mean,
+		Low:  mean - margin,
+		High: mean + margin,
+	}
+}
+
+type ExperimentResult struct {
+	Name            string   `json:"name"`
+	Category        string   `json:"category"`
+	Parameter       string   `json:"parameter"`
+	ChatWtdShare    MetricCI `json:"chat_wtd_share"`
+	ChatRawShare    MetricCI `json:"chat_raw_share"`
+	MaxMinRatio     MetricCI `json:"max_min_ratio"`
+	ChatTTFTMeanMs  MetricCI `json:"chat_ttft_mean_ms"`
+	ChatTTFTP95Ms   MetricCI `json:"chat_ttft_p95_ms"`
+	RAGTTFTMeanMs   MetricCI `json:"rag_ttft_mean_ms"`
+	RAGTTFTP95Ms    MetricCI `json:"rag_ttft_p95_ms"`
+	PredictorMAE    MetricCI `json:"predictor_mae_tokens"`
+	CounterDrift    MetricCI `json:"counter_drift_tokens"`
+	SeedsCount      int      `json:"seeds_count"`
+}
+
+type SingleRunResult struct {
+	ChatRawShare   float64
+	ChatWtdShare   float64
+	MaxMinRatio    float64
+	ChatTTFTMeanMs float64
+	ChatTTFTP95Ms  float64
+	RAGTTFTMeanMs  float64
+	RAGTTFTP95Ms   float64
+	PredictorMAE   float64
+	CounterDrift   float64
+}
+
+var seeds = []int64{12345, 23456, 34567, 45678, 56789}
+
+func aggregateRuns(name, category, param string, runs []SingleRunResult) ExperimentResult {
+	wtdShares := make([]float64, len(runs))
+	rawShares := make([]float64, len(runs))
+	maxMins := make([]float64, len(runs))
+	chatTTFTMeans := make([]float64, len(runs))
+	chatTTFTP95s := make([]float64, len(runs))
+	ragTTFTMeans := make([]float64, len(runs))
+	ragTTFTP95s := make([]float64, len(runs))
+	maes := make([]float64, len(runs))
+	drifts := make([]float64, len(runs))
+
+	for i, r := range runs {
+		wtdShares[i] = r.ChatWtdShare
+		rawShares[i] = r.ChatRawShare
+		maxMins[i] = r.MaxMinRatio
+		chatTTFTMeans[i] = r.ChatTTFTMeanMs
+		chatTTFTP95s[i] = r.ChatTTFTP95Ms
+		ragTTFTMeans[i] = r.RAGTTFTMeanMs
+		ragTTFTP95s[i] = r.RAGTTFTP95Ms
+		maes[i] = r.PredictorMAE
+		drifts[i] = r.CounterDrift
+	}
+
+	return ExperimentResult{
+		Name:           name,
+		Category:       category,
+		Parameter:      param,
+		ChatWtdShare:   calcCI(wtdShares),
+		ChatRawShare:   calcCI(rawShares),
+		MaxMinRatio:    calcCI(maxMins),
+		ChatTTFTMeanMs: calcCI(chatTTFTMeans),
+		ChatTTFTP95Ms:  calcCI(chatTTFTP95s),
+		RAGTTFTMeanMs:  calcCI(ragTTFTMeans),
+		RAGTTFTP95Ms:   calcCI(ragTTFTP95s),
+		PredictorMAE:   calcCI(maes),
+		CounterDrift:   calcCI(drifts),
+		SeedsCount:     len(runs),
+	}
 }
 
 func main() {
-	fmt.Println("================================================================================")
-	fmt.Println("             FAIRLANE PHASE 2a BENCHMARK MATRIX EVALUATION                     ")
-	fmt.Println("================================================================================")
+	fmt.Println("==================================================================================================")
+	fmt.Println("                   FAIRLANE PHASE 2a BENCHMARK MATRIX EVALUATION (FIX GATE)                       ")
+	fmt.Println("==================================================================================================")
+	fmt.Printf("Evaluation parameters: N=%d seeds %v, 95%% Student-t CIs, Window: [5.0s, 30.0s]\n", len(seeds), seeds)
+	fmt.Println("Continuous batching server: MaxBatch=16, KVCapacity=16384 tok, StepBase=5ms, PerToken=5µs")
 
-	var allResults []SummaryResult
+	var allResults []ExperimentResult
 
 	// -------------------------------------------------------------------------
 	// 1. DRR Token Quantum & Weight Sweep
 	// -------------------------------------------------------------------------
-	fmt.Println("\n--- 1. DEFICIT ROUND ROBIN (DRR) TOKEN QUANTUM & WEIGHT EVALUATION ---")
-	fmt.Printf("%-24s | %-10s | %-12s | %-12s | %-10s\n", "Configuration", "Quantum", "Chat Raw (%)", "Chat Wtd (%)", "Max-Min")
-	fmt.Println("--------------------------------------------------------------------------------")
+	fmt.Println("\n==================================================================================================")
+	fmt.Println("1. DEFICIT ROUND ROBIN (DRR) TOKEN QUANTUM & WEIGHT EVALUATION")
+	fmt.Println("Invariant: DRR charges weighted tokens (w_in*in + w_out*pred_out) corrected on completion.")
+	fmt.Println("Hypothesis: Quantum determines burstiness/granularity, NOT long-run share (~50.0% weighted share).")
+	fmt.Println("--------------------------------------------------------------------------------------------------")
+	fmt.Printf("%-18s | %-12s | %-24s | %-24s | %-18s | %-18s\n",
+		"Configuration", "Quantum", "Chat Wtd Share (95% CI)", "Chat Raw Share (95% CI)", "Max-Min (95% CI)", "Chat TTFT ms (CI)")
+	fmt.Println("--------------------------------------------------------------------------------------------------")
 
 	quantums := []int{256, 512, 1024, 2048}
 	for _, q := range quantums {
-		cfg := policy.DefaultDRRConfig()
-		cfg.BaseQuantumTokens = q
-		pol := policy.NewDRR(cfg)
+		var runs []SingleRunResult
+		for _, seed := range seeds {
+			cfg := policy.DefaultDRRConfig()
+			cfg.BaseQuantumTokens = q
+			cfg.InputWeight = 1.0
+			cfg.OutputWeight = 2.0
+			cfg.UsePredictedCost = true
+			pol := policy.NewDRR(cfg)
 
-		res := runHeterogeneousSimulation(pol, nil, sim.GatewayConfig{Enabled: false}, 1.0)
-		res.Category = "drr_quantum"
-		res.Parameter = fmt.Sprintf("Q=%d", q)
-		res.Name = fmt.Sprintf("drr-q%d", q)
-		allResults = append(allResults, res)
-
-		fmt.Printf("%-24s | %-10d | %11.1f%% | %11.1f%% | %9.2f\n",
-			res.Name, q, res.ChatRawShare*100, res.ChatWtdShare*100, res.MaxMinRatio)
-	}
-
-	// DRR with Weights (Chat weight = 2.0, RAG weight = 1.0)
-	cfgWeighted := policy.DefaultDRRConfig()
-	cfgWeighted.BaseQuantumTokens = 512
-	cfgWeighted.TenantWeights = map[string]float64{"chat": 2.0, "rag": 1.0}
-	drrWeighted := policy.NewDRR(cfgWeighted)
-	resWeighted := runHeterogeneousSimulation(drrWeighted, nil, sim.GatewayConfig{Enabled: false}, 1.0)
-	resWeighted.Category = "drr_weighted"
-	resWeighted.Parameter = "w_chat=2.0,w_rag=1.0"
-	resWeighted.Name = "drr-weighted-2x"
-	allResults = append(allResults, resWeighted)
-	fmt.Printf("%-24s | %-10s | %11.1f%% | %11.1f%% | %9.2f\n",
-		resWeighted.Name, "512 (w=2:1)", resWeighted.ChatRawShare*100, resWeighted.ChatWtdShare*100, resWeighted.MaxMinRatio)
-
-	// -------------------------------------------------------------------------
-	// 2. Predictors & Charging Variants Sweep
-	// -------------------------------------------------------------------------
-	fmt.Println("\n--- 2. PREDICTORS & CHARGING VARIANTS (VTC) ---")
-	fmt.Printf("%-28s | %-16s | %-12s | %-12s | %-10s\n", "Policy Variant", "Charging Model", "Chat Raw (%)", "Chat Wtd (%)", "Max-Min")
-	fmt.Println("--------------------------------------------------------------------------------")
-
-	// 2a. Incremental charging (VTC native)
-	cfgInc := policy.DefaultVTCConfig()
-	cfgInc.ChargingModel = policy.ChargingIncremental
-	resInc := runHeterogeneousSimulation(policy.NewVTC(cfgInc), nil, sim.GatewayConfig{Enabled: false}, 1.0)
-	resInc.Category = "charging_variants"
-	resInc.Parameter = "incremental"
-	resInc.Name = "vtc-incremental-native"
-	allResults = append(allResults, resInc)
-	fmt.Printf("%-28s | %-16s | %11.1f%% | %11.1f%% | %9.2f\n",
-		resInc.Name, "incremental", resInc.ChatRawShare*100, resInc.ChatWtdShare*100, resInc.MaxMinRatio)
-
-	// 2b. Completion charging
-	cfgComp := policy.DefaultVTCConfig()
-	cfgComp.ChargingModel = policy.ChargingCompletion
-	resComp := runHeterogeneousSimulation(policy.NewVTC(cfgComp), nil, sim.GatewayConfig{Enabled: false}, 1.0)
-	resComp.Category = "charging_variants"
-	resComp.Parameter = "completion"
-	resComp.Name = "vtc-completion-charging"
-	allResults = append(allResults, resComp)
-	fmt.Printf("%-28s | %-16s | %11.1f%% | %11.1f%% | %9.2f\n",
-		resComp.Name, "completion", resComp.ChatRawShare*100, resComp.ChatWtdShare*100, resComp.MaxMinRatio)
-
-	// 2c. Predicted at admission + correct on completion with different predictors
-	predictors := []struct {
-		name string
-		pred policy.OutputPredictor
-	}{
-		{"oracle", policy.NewOraclePredictor()},
-		{"mean-prior", policy.NewMeanPredictor(64)},
-		{"noisy-oracle (+20% bias)", policy.NewNoisyOraclePredictor(0.3, 0.20, 42)},
-		{"noisy-oracle (-20% bias)", policy.NewNoisyOraclePredictor(0.3, -0.20, 42)},
-	}
-
-	for _, p := range predictors {
-		cfgPred := policy.DefaultVTCConfig()
-		cfgPred.ChargingModel = policy.ChargingPredictedAtAdmission
-		pol := policy.NewVTC(cfgPred)
-
-		res := runHeterogeneousSimulation(pol, p.pred, sim.GatewayConfig{Enabled: false}, 1.0)
-		res.Category = "predicted_admission"
-		res.Parameter = p.name
-		res.Name = fmt.Sprintf("vtc-pred-%s", p.name)
-		allResults = append(allResults, res)
-		fmt.Printf("%-28s | %-16s | %11.1f%% | %11.1f%% | %9.2f\n",
-			res.Name, "pred-admission", res.ChatRawShare*100, res.ChatWtdShare*100, res.MaxMinRatio)
-	}
-
-	// -------------------------------------------------------------------------
-	// 3. Gateway In-Flight Cap K Sweep
-	// -------------------------------------------------------------------------
-	fmt.Println("\n--- 3. GATEWAY MODE: ENGINE IN-FLIGHT CAP K SWEEP ---")
-	fmt.Printf("%-24s | %-8s | %-12s | %-12s | %-10s\n", "Configuration", "Cap K", "Chat Raw (%)", "Chat Wtd (%)", "Max-Min")
-	fmt.Println("--------------------------------------------------------------------------------")
-
-	caps := []int{4, 8, 16, 32}
-	for _, capK := range caps {
-		gwCfg := sim.GatewayConfig{
-			Enabled:      true,
-			MaxInFlightK: capK,
+			res := runSimulation(pol, nil, sim.GatewayConfig{Enabled: false}, 1.0, false, false, seed)
+			runs = append(runs, res)
 		}
-		pol := policy.NewVTC(policy.DefaultVTCConfig())
-		res := runHeterogeneousSimulation(pol, nil, gwCfg, 1.0)
-		res.Category = "gateway_cap_k"
-		res.Parameter = fmt.Sprintf("K=%d", capK)
-		res.Name = fmt.Sprintf("gateway-vtc-k%d", capK)
-		allResults = append(allResults, res)
+		agg := aggregateRuns(fmt.Sprintf("drr-q%d", q), "drr_quantum", fmt.Sprintf("Q=%d", q), runs)
+		allResults = append(allResults, agg)
+		fmt.Printf("%-18s | %-12d | %-24s | %-24s | %-18s | %-18s\n",
+			agg.Name, q, agg.ChatWtdShare.StringPct(), agg.ChatRawShare.StringPct(), agg.MaxMinRatio.String(), agg.ChatTTFTMeanMs.String())
+	}
 
-		fmt.Printf("%-24s | %-8d | %11.1f%% | %11.1f%% | %9.2f\n",
-			res.Name, capK, res.ChatRawShare*100, res.ChatWtdShare*100, res.MaxMinRatio)
+	// Weighted DRR (Chat w=2.0, RAG w=1.0, Q=512)
+	{
+		var runs []SingleRunResult
+		for _, seed := range seeds {
+			cfg := policy.DefaultDRRConfig()
+			cfg.BaseQuantumTokens = 512
+			cfg.InputWeight = 1.0
+			cfg.OutputWeight = 2.0
+			cfg.TenantWeights = map[string]float64{"chat": 2.0, "rag": 1.0}
+			cfg.UsePredictedCost = true
+			pol := policy.NewDRR(cfg)
+
+			res := runSimulation(pol, nil, sim.GatewayConfig{Enabled: false}, 1.0, false, false, seed)
+			runs = append(runs, res)
+		}
+		agg := aggregateRuns("drr-weighted-2x", "drr_weighted", "w_chat=2,w_rag=1", runs)
+		allResults = append(allResults, agg)
+		fmt.Printf("%-18s | %-12s | %-24s | %-24s | %-18s | %-18s\n",
+			agg.Name, "512 (w=2:1)", agg.ChatWtdShare.StringPct(), agg.ChatRawShare.StringPct(), agg.MaxMinRatio.String(), agg.ChatTTFTMeanMs.String())
+	}
+
+	// -------------------------------------------------------------------------
+	// 2. Predictor Study Under Heavy-Tailed Output Lengths
+	// -------------------------------------------------------------------------
+	fmt.Println("\n==================================================================================================")
+	fmt.Println("2. PREDICTOR STUDY UNDER HEAVY-TAILED OUTPUT LENGTHS (VTC Predicted-Admission)")
+	fmt.Println("Workload: Log-Normal outputs (Chat med=64 tok, sigma=0.75; RAG med=128 tok, sigma=0.75)")
+	fmt.Println("Charging: w_in*in + w_out*predicted_out at admission, corrected by w_out*(actual - pred) on completion.")
+	fmt.Println("--------------------------------------------------------------------------------------------------")
+	fmt.Printf("%-32s | %-18s | %-18s | %-20s | %-16s | %-16s\n",
+		"Predictor Variant", "Chat Wtd Share", "Chat Raw Share", "Victim TTFT Mean ms", "Predictor MAE", "Counter Drift")
+	fmt.Println("--------------------------------------------------------------------------------------------------")
+
+	type predSpec struct {
+		name      string
+		param     string
+		buildPred func(seed int64) policy.OutputPredictor
+	}
+
+	predVariants := []predSpec{
+		{
+			name:      "pred-oracle",
+			param:     "oracle",
+			buildPred: func(s int64) policy.OutputPredictor { return policy.NewOraclePredictor() },
+		},
+		{
+			name:      "pred-mean-prior-64",
+			param:     "mean(64)",
+			buildPred: func(s int64) policy.OutputPredictor { return policy.NewMeanPredictor(64) },
+		},
+		{
+			name:  "pred-noisy (sigma=0.3, bias=0)",
+			param: "sigma=0.3,bias=0.0",
+			buildPred: func(s int64) policy.OutputPredictor {
+				return policy.NewNoisyOraclePredictor(0.3, 0.0, s)
+			},
+		},
+		{
+			name:  "pred-noisy (sigma=0.3, bias=+25%)",
+			param: "sigma=0.3,bias=+0.25",
+			buildPred: func(s int64) policy.OutputPredictor {
+				return policy.NewNoisyOraclePredictor(0.3, 0.25, s)
+			},
+		},
+		{
+			name:  "pred-noisy (sigma=0.3, bias=-25%)",
+			param: "sigma=0.3,bias=-0.25",
+			buildPred: func(s int64) policy.OutputPredictor {
+				return policy.NewNoisyOraclePredictor(0.3, -0.25, s)
+			},
+		},
+		{
+			name:  "pred-noisy (sigma=0.6, bias=0)",
+			param: "sigma=0.6,bias=0.0",
+			buildPred: func(s int64) policy.OutputPredictor {
+				return policy.NewNoisyOraclePredictor(0.6, 0.0, s)
+			},
+		},
+		{
+			name:  "pred-noisy (sigma=0.6, bias=+50%)",
+			param: "sigma=0.6,bias=+0.50",
+			buildPred: func(s int64) policy.OutputPredictor {
+				return policy.NewNoisyOraclePredictor(0.6, 0.50, s)
+			},
+		},
+	}
+
+	for _, pv := range predVariants {
+		var runs []SingleRunResult
+		for _, seed := range seeds {
+			pred := pv.buildPred(seed)
+			cfg := policy.DefaultVTCConfig()
+			cfg.ChargingModel = policy.ChargingPredictedAtAdmission
+			pol := policy.NewVTC(cfg)
+
+			res := runSimulation(pol, pred, sim.GatewayConfig{Enabled: false}, 1.0, true, false, seed)
+			runs = append(runs, res)
+		}
+		agg := aggregateRuns(pv.name, "predictor_heavy_tail", pv.param, runs)
+		allResults = append(allResults, agg)
+		fmt.Printf("%-32s | %-18s | %-18s | %-20s | %-16s | %-16s\n",
+			agg.Name, agg.ChatWtdShare.StringPct(), agg.ChatRawShare.StringPct(),
+			agg.ChatTTFTMeanMs.String(), agg.PredictorMAE.String(), agg.CounterDrift.String())
+	}
+
+	// -------------------------------------------------------------------------
+	// 3. Engine In-Flight Cap K Sweep
+	// -------------------------------------------------------------------------
+	fmt.Println("\n==================================================================================================")
+	fmt.Println("3. GATEWAY MODE: ENGINE IN-FLIGHT CAP K SWEEP")
+	fmt.Println("Engine max batch size B = 16. Gateway limits concurrent engine in-flight requests to K.")
+	fmt.Println("Mechanism: When K <= 16, gateway queues requests and schedules them just-in-time into the batch.")
+	fmt.Println("           When K > 16, excess requests spill into engine internal FIFO queue, bypassing gateway fairness.")
+	fmt.Println("--------------------------------------------------------------------------------------------------")
+	fmt.Printf("%-20s | %-8s | %-22s | %-22s | %-18s | %-18s\n",
+		"Configuration", "Cap K", "Victim TTFT Mean ms", "Victim TTFT P95 ms", "Chat Wtd Share", "Chat Raw Share")
+	fmt.Println("--------------------------------------------------------------------------------------------------")
+
+	caps := []struct {
+		k     int
+		label string
+	}{
+		{4, "K=4"},
+		{16, "K=16 (B)"},
+		{64, "K=64"},
+		{256, "K=256"},
+		{10000, "unbounded"},
+	}
+
+	for _, c := range caps {
+		var runs []SingleRunResult
+		for _, seed := range seeds {
+			gwCfg := sim.GatewayConfig{
+				Enabled:      true,
+				MaxInFlightK: c.k,
+			}
+			pol := policy.NewVTC(policy.DefaultVTCConfig())
+			res := runSimulation(pol, nil, gwCfg, 1.0, false, false, seed)
+			runs = append(runs, res)
+		}
+		agg := aggregateRuns(fmt.Sprintf("gateway-k-%s", c.label), "gateway_cap_k", c.label, runs)
+		allResults = append(allResults, agg)
+		fmt.Printf("%-20s | %-8s | %-22s | %-22s | %-18s | %-18s\n",
+			agg.Name, c.label, agg.ChatTTFTMeanMs.String(), agg.ChatTTFTP95Ms.String(),
+			agg.ChatWtdShare.StringPct(), agg.ChatRawShare.StringPct())
 	}
 
 	// -------------------------------------------------------------------------
 	// 4. Capacity Load Sweep (~50%, 80%, 95%, 120%)
 	// -------------------------------------------------------------------------
-	fmt.Println("\n--- 4. CAPACITY LOAD SWEEP (~50%, 80%, 95%, 120% CAPACITY) ---")
-	fmt.Printf("%-18s | %-8s | %-12s | %-12s | %-14s | %-14s\n",
-		"Policy", "Load (%)", "Chat Raw (%)", "Chat Wtd (%)", "Chat TTFT (ms)", "RAG TTFT (ms)")
-	fmt.Println("------------------------------------------------------------------------------------------------")
+	fmt.Println("\n==================================================================================================")
+	fmt.Println("4. CAPACITY LOAD SWEEP (~50%, 80%, 95%, 120% CAPACITY)")
+	fmt.Println("Capacity Definition: Nominal load (1.0 = 100%) matches continuous batching saturation where arrival")
+	fmt.Println("rate (Chat 50 req/s + RAG 10 req/s = 50,880 raw tok/s) equals maximum sustained engine throughput.")
+	fmt.Println("Note: Policies allocate different token shares (e.g. FIFO gives Chat ~23% wtd share while VTC/DRR give")
+	fmt.Println("      ~50%). TTFT comparisons reflect both queuing priority and allocated service share.")
+	fmt.Println("--------------------------------------------------------------------------------------------------")
+	fmt.Printf("%-10s | %-8s | %-20s | %-20s | %-20s | %-20s\n",
+		"Policy", "Load", "Chat Wtd Share", "Chat Raw Share", "Chat TTFT Mean ms", "RAG TTFT Mean ms")
+	fmt.Println("--------------------------------------------------------------------------------------------------")
 
 	loads := []struct {
 		label string
@@ -166,26 +352,95 @@ func main() {
 	}
 
 	loadPolicies := []struct {
-		name string
-		pol  policy.Policy
+		name      string
+		buildPoly func() policy.Policy
 	}{
-		{"fifo", policy.NewFIFO()},
-		{"drr", policy.NewDRR(policy.DefaultDRRConfig())},
-		{"vtc", policy.NewVTC(policy.DefaultVTCConfig())},
+		{"fifo", func() policy.Policy { return policy.NewFIFO() }},
+		{"drr", func() policy.Policy { return policy.NewDRR(policy.DefaultDRRConfig()) }},
+		{"vtc", func() policy.Policy { return policy.NewVTC(policy.DefaultVTCConfig()) }},
 	}
 
 	for _, lp := range loadPolicies {
 		for _, l := range loads {
-			res := runHeterogeneousSimulation(lp.pol, nil, sim.GatewayConfig{Enabled: false}, l.scale)
-			res.Category = "load_sweep"
-			res.Parameter = fmt.Sprintf("%s-load-%s", lp.name, l.label)
-			res.Name = fmt.Sprintf("%s-%s", lp.name, l.label)
-			allResults = append(allResults, res)
-
-			fmt.Printf("%-18s | %-8s | %11.1f%% | %11.1f%% | %14.1f | %14.1f\n",
-				lp.name, l.label, res.ChatRawShare*100, res.ChatWtdShare*100, res.ChatTTFTMeanMs, res.RAGTTFTMeanMs)
+			var runs []SingleRunResult
+			for _, seed := range seeds {
+				pol := lp.buildPoly()
+				res := runSimulation(pol, nil, sim.GatewayConfig{Enabled: false}, l.scale, false, false, seed)
+				runs = append(runs, res)
+			}
+			agg := aggregateRuns(fmt.Sprintf("%s-%s", lp.name, l.label), "load_sweep", fmt.Sprintf("%s-%s", lp.name, l.label), runs)
+			allResults = append(allResults, agg)
+			fmt.Printf("%-10s | %-8s | %-20s | %-20s | %-20s | %-20s\n",
+				lp.name, l.label, agg.ChatWtdShare.StringPct(), agg.ChatRawShare.StringPct(),
+				agg.ChatTTFTMeanMs.String(), agg.RAGTTFTMeanMs.String())
 		}
 	}
+
+	// -------------------------------------------------------------------------
+	// 5. Priority-Band Experiment (Strict Inter-Tier Priority)
+	// -------------------------------------------------------------------------
+	fmt.Println("\n==================================================================================================")
+	fmt.Println("5. PRIORITY-BAND EXPERIMENT: STRICT INTER-TIER PRIORITY SCHEDULING")
+	fmt.Println("Setup: Tier 0 (High Priority / Interactive Chat) vs Tier 1 (Best Effort / Batch RAG).")
+	fmt.Println("Mechanism: Tier 0 requests preempt Tier 1 from scheduling slots whenever backlogged.")
+	fmt.Println("--------------------------------------------------------------------------------------------------")
+	fmt.Printf("%-32s | %-20s | %-20s | %-16s | %-16s\n",
+		"Configuration", "Tier 0 TTFT Mean ms", "Tier 1 TTFT Mean ms", "Tier 0 Wtd Share", "Tier 1 Wtd Share")
+	fmt.Println("--------------------------------------------------------------------------------------------------")
+
+	// 5a. Baseline: Flat VTC (No Priority, Full Load)
+	{
+		var runs []SingleRunResult
+		for _, seed := range seeds {
+			pol := policy.NewVTC(policy.DefaultVTCConfig())
+			res := runSimulation(pol, nil, sim.GatewayConfig{Enabled: false}, 1.0, false, false, seed)
+			runs = append(runs, res)
+		}
+		agg := aggregateRuns("baseline-no-priority", "priority_bands", "flat-vtc-full", runs)
+		allResults = append(allResults, agg)
+		fmt.Printf("%-32s | %-20s | %-20s | %-16s | %-16s\n",
+			"Flat VTC (No Priority, 100% Load)", agg.ChatTTFTMeanMs.String(), agg.RAGTTFTMeanMs.String(),
+			agg.ChatWtdShare.StringPct(), fmt.Sprintf("%.1f%%", (1.0-agg.ChatWtdShare.Mean)*100))
+	}
+
+	// 5b. Priority Bands: Full Overload (Tier 0 saturates capacity)
+	{
+		var runs []SingleRunResult
+		for _, seed := range seeds {
+			pbMap := map[int]policy.Policy{
+				0: policy.NewVTC(policy.DefaultVTCConfig()),
+				1: policy.NewVTC(policy.DefaultVTCConfig()),
+			}
+			pol := policy.NewPriorityBandPolicy(pbMap)
+			res := runSimulation(pol, nil, sim.GatewayConfig{Enabled: false}, 1.0, false, true, seed)
+			runs = append(runs, res)
+		}
+		agg := aggregateRuns("priority-bands-overload", "priority_bands", "t0-saturating-100", runs)
+		allResults = append(allResults, agg)
+		fmt.Printf("%-32s | %-20s | %-20s | %-16s | %-16s\n",
+			"Priority Bands (T0 Overload)", agg.ChatTTFTMeanMs.String(), "Preempted / Stalled",
+			agg.ChatWtdShare.StringPct(), fmt.Sprintf("%.1f%%", (1.0-agg.ChatWtdShare.Mean)*100))
+	}
+
+	// 5c. Priority Bands: Managed Tier 0 Load (Tier 0 takes ~40% load, Tier 1 gets residual capacity)
+	{
+		var runs []SingleRunResult
+		for _, seed := range seeds {
+			pbMap := map[int]policy.Policy{
+				0: policy.NewVTC(policy.DefaultVTCConfig()),
+				1: policy.NewVTC(policy.DefaultVTCConfig()),
+			}
+			pol := policy.NewPriorityBandPolicy(pbMap)
+			res := runSimulation(pol, nil, sim.GatewayConfig{Enabled: false}, 0.60, false, true, seed)
+			runs = append(runs, res)
+		}
+		agg := aggregateRuns("priority-bands-managed", "priority_bands", "t0-managed-60", runs)
+		allResults = append(allResults, agg)
+		fmt.Printf("%-32s | %-20s | %-20s | %-16s | %-16s\n",
+			"Priority Bands (T0 Managed 60%)", agg.ChatTTFTMeanMs.String(), agg.RAGTTFTMeanMs.String(),
+			agg.ChatWtdShare.StringPct(), fmt.Sprintf("%.1f%%", (1.0-agg.ChatWtdShare.Mean)*100))
+	}
+
 
 	// Save all results to experiments/results/exp_phase2a_summary.json
 	os.MkdirAll("experiments/results", 0755)
@@ -193,21 +448,24 @@ func main() {
 	data, err := json.MarshalIndent(allResults, "", "  ")
 	if err == nil {
 		os.WriteFile(outPath, data, 0644)
-		fmt.Printf("\nSaved complete Phase 2a evaluation matrix to: %s\n", outPath)
+		fmt.Printf("\nSaved complete Phase 2a evaluation matrix with CIs to: %s\n", outPath)
 	}
 
-	fmt.Println("\n================================================================================")
-	fmt.Println("             PHASE 2a BENCHMARK MATRIX COMPLETED SUCCESSFULLY                   ")
-	fmt.Println("================================================================================")
+	fmt.Println("\n==================================================================================================")
+	fmt.Println("                      PHASE 2a BENCHMARK MATRIX COMPLETED SUCCESSFULLY                            ")
+	fmt.Println("==================================================================================================")
 }
 
-// runHeterogeneousSimulation executes a synthetic workload trace with Chat vs RAG tenants.
-func runHeterogeneousSimulation(
+// runSimulation executes a single seed simulation.
+func runSimulation(
 	pol policy.Policy,
 	predictor policy.OutputPredictor,
 	gwCfg sim.GatewayConfig,
 	loadScale float64,
-) SummaryResult {
+	heavyTailed bool,
+	priorityMode bool,
+	seed int64,
+) SingleRunResult {
 	serverCfg := sim.ServerConfig{
 		MaxBatchSize:     16,
 		KVCapacityTokens: 16384,
@@ -219,21 +477,18 @@ func runHeterogeneousSimulation(
 	qm := sim.NewTenantQueueManager()
 	var engineQueue []*sim.Request
 
-	// Workload parameters:
-	// Chat: prompt 128, decode 64. Nominal 50 req/s.
-	// RAG:  prompt 4000, decode 128. Nominal 10 req/s.
 	chatRate := 50.0 * loadScale
 	ragRate := 10.0 * loadScale
 	horizonS := 30.0
 	horizonUs := int64(horizonS * 1e6)
 	warmupUs := int64(5.0 * 1e6)
-
-	// Generate extra arrivals past the horizon to ensure backlog
 	arrivalHorizonS := horizonS + 20.0
 
-	rng := rand.New(rand.NewSource(12345))
+	rng := rand.New(rand.NewSource(seed))
 
 	var trace []*sim.Request
+	var predErrors []float64
+	var counterDrifts []float64
 
 	// Generate Chat arrivals
 	var tUs float64 = 0
@@ -246,12 +501,32 @@ func runHeterogeneousSimulation(
 		}
 		reqID++
 		id := fmt.Sprintf("chat-%05d", reqID)
+
 		actualOut := 64
-		predOut := 64
+		if heavyTailed {
+			// Log-normal: median 64, sigma 0.75, range [8, 512]
+			val := math.Round(64.0 * math.Exp(0.75*rng.NormFloat64()))
+			if val < 8 {
+				val = 8
+			} else if val > 512 {
+				val = 512
+			}
+			actualOut = int(val)
+		}
+
+		predOut := actualOut
 		if predictor != nil {
 			predOut = predictor.Predict("chat", 128, actualOut)
+			errVal := math.Abs(float64(predOut - actualOut))
+			predErrors = append(predErrors, errVal)
+			counterDrifts = append(counterDrifts, 2.0*errVal) // w_out = 2.0
 		}
-		trace = append(trace, sim.NewRequest(id, "chat", 128, actualOut, predOut, int64(tUs)))
+
+		req := sim.NewRequest(id, "chat", 128, actualOut, predOut, int64(tUs))
+		if priorityMode {
+			req.WithPriority(0) // Tier 0 = High
+		}
+		trace = append(trace, req)
 	}
 
 	// Generate RAG arrivals
@@ -265,15 +540,35 @@ func runHeterogeneousSimulation(
 		}
 		reqID++
 		id := fmt.Sprintf("rag-%05d", reqID)
+
 		actualOut := 128
-		predOut := 128
+		if heavyTailed {
+			// Log-normal: median 128, sigma 0.75, range [16, 1024]
+			val := math.Round(128.0 * math.Exp(0.75*rng.NormFloat64()))
+			if val < 16 {
+				val = 16
+			} else if val > 1024 {
+				val = 1024
+			}
+			actualOut = int(val)
+		}
+
+		predOut := actualOut
 		if predictor != nil {
 			predOut = predictor.Predict("rag", 4000, actualOut)
+			errVal := math.Abs(float64(predOut - actualOut))
+			predErrors = append(predErrors, errVal)
+			counterDrifts = append(counterDrifts, 2.0*errVal)
 		}
-		trace = append(trace, sim.NewRequest(id, "rag", 4000, actualOut, predOut, int64(tUs)))
+
+		req := sim.NewRequest(id, "rag", 4000, actualOut, predOut, int64(tUs))
+		if priorityMode {
+			req.WithPriority(1) // Tier 1 = Low
+		}
+		trace = append(trace, req)
 	}
 
-	// Sort trace by arrival timestamp
+	// Sort trace stably by ArrivalTime, then ID
 	sort.Slice(trace, func(i, j int) bool {
 		if trace[i].ArrivalTime() == trace[j].ArrivalTime() {
 			return trace[i].ID() < trace[j].ID()
@@ -301,7 +596,7 @@ func runHeterogeneousSimulation(
 		// 2. Batch formation
 		if gwCfg.Enabled {
 			// Gateway mode
-			for len(engineQueue)+server.RunningCount() < gwCfg.MaxInFlightK && qm.TotalQueuedRequests() > 0 {
+			for (gwCfg.MaxInFlightK >= 10000 || len(engineQueue)+server.RunningCount() < gwCfg.MaxInFlightK) && qm.TotalQueuedRequests() > 0 {
 				winner := pol.Pick(qm)
 				if winner == "" {
 					break
@@ -392,33 +687,64 @@ func runHeterogeneousSimulation(
 	}
 
 	meanChatTTFT := 0.0
+	p95ChatTTFT := 0.0
 	if len(chatTTFTs) > 0 {
+		sort.Slice(chatTTFTs, func(i, j int) bool { return chatTTFTs[i] < chatTTFTs[j] })
 		var sum int64
 		for _, v := range chatTTFTs {
 			sum += v
 		}
-		meanChatTTFT = float64(sum) / float64(len(chatTTFTs)) / 1000.0 // ms
+		meanChatTTFT = float64(sum) / float64(len(chatTTFTs)) / 1000.0
+		p95Idx := int(float64(len(chatTTFTs)) * 0.95)
+		if p95Idx >= len(chatTTFTs) {
+			p95Idx = len(chatTTFTs) - 1
+		}
+		p95ChatTTFT = float64(chatTTFTs[p95Idx]) / 1000.0
 	}
 
 	meanRAGTTFT := 0.0
+	p95RAGTTFT := 0.0
 	if len(ragTTFTs) > 0 {
+		sort.Slice(ragTTFTs, func(i, j int) bool { return ragTTFTs[i] < ragTTFTs[j] })
 		var sum int64
 		for _, v := range ragTTFTs {
 			sum += v
 		}
-		meanRAGTTFT = float64(sum) / float64(len(ragTTFTs)) / 1000.0 // ms
+		meanRAGTTFT = float64(sum) / float64(len(ragTTFTs)) / 1000.0
+		p95Idx := int(float64(len(ragTTFTs)) * 0.95)
+		if p95Idx >= len(ragTTFTs) {
+			p95Idx = len(ragTTFTs) - 1
+		}
+		p95RAGTTFT = float64(ragTTFTs[p95Idx]) / 1000.0
 	}
 
-	return SummaryResult{
+	meanMAE := 0.0
+	if len(predErrors) > 0 {
+		var sum float64
+		for _, e := range predErrors {
+			sum += e
+		}
+		meanMAE = sum / float64(len(predErrors))
+	}
+
+	meanDrift := 0.0
+	if len(counterDrifts) > 0 {
+		var sum float64
+		for _, d := range counterDrifts {
+			sum += d
+		}
+		meanDrift = sum / float64(len(counterDrifts))
+	}
+
+	return SingleRunResult{
 		ChatRawShare:   chatRawShare,
 		ChatWtdShare:   chatWtdShare,
 		MaxMinRatio:    maxMin,
 		ChatTTFTMeanMs: meanChatTTFT,
+		ChatTTFTP95Ms:  p95ChatTTFT,
 		RAGTTFTMeanMs:  meanRAGTTFT,
-		TotalTokens:    rawChat + rawRAG,
-		PerTenantTokens: map[string]int{
-			"chat": rawChat,
-			"rag":  rawRAG,
-		},
+		RAGTTFTP95Ms:   p95RAGTTFT,
+		PredictorMAE:   meanMAE,
+		CounterDrift:   meanDrift,
 	}
 }
