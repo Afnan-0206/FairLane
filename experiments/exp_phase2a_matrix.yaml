@@ -1,45 +1,56 @@
-# FairLane Phase 2a Matrix Pre-Registration Specification
-# Pre-registered before running Phase 2a benchmark suite.
+# FairLane Phase 2a-fix2 Matrix Pre-Registration Specification
+# Status: [Pilot-Informed Rerun Design]
+# Pre-registered and committed before running the Phase 2a-fix2 matrix.
 #
-# Evaluation Dimensions:
-# 1. DRR Quantum & Weight Sweep:
-#    - Base quantum Q in {256, 512, 1024, 2048} with equal weights (1.0 : 1.0)
-#    - Weighted DRR with Chat:RAG = 2.0 : 1.0 (Q=512)
-#    - Hypothesis: DRR token quantum affects batch granularity and TTFT jitter, but NOT long-run share.
-#      Under completion-corrected weighted token charging (w_in=1, w_out=2), long-run weighted share is ~50.0% (raw ~43.5%).
+# Evaluation Dimensions & Hypotheses:
+# 1. Capacity Calibration & Load Sweep:
+#    - Max sustainable throughput is calibrated via empirical steady-state saturating run under continuous batching
+#      (B=16, KV=16384 tok, stepBase=5ms, perToken=5µs).
+#    - Measured Capacity: C_measured ~ 20,778 weighted tok/s (17,867 raw tok/s).
+#    - Arrival rates are defined strictly as fractions of measured capacity: 50%, 80%, 95%, 120%.
+#    - Hypothesis 1.1 [Pre-registered]: At 50% load (unsaturated), all work-conserving policies (FIFO, DRR, VTC)
+#      match the arrival-mix token share (~23.1% weighted, ~18.9% raw share).
+#    - Hypothesis 1.2 [Pre-registered]: At 120% load (overload), VTC and DRR diverge from arrival mix to enforce
+#      exact 50.0% (+/- 1%) weighted token fairness, whereas FIFO continues to serve the arrival mix.
 #
-# 2. Predictor Study Under Heavy-Tailed Outputs:
-#    - Log-normal heavy-tailed output distribution:
-#        Chat: median 64 tokens, sigma 0.75, range [8, 512]
-#        RAG:  median 128 tokens, sigma 0.75, range [16, 1024]
-#    - Predictors: Oracle, Mean-per-tenant, Noisy-Oracle (sigma in {0.3, 0.6}, bias in {-0.25, 0.0, +0.25, +0.50})
-#    - Metrics: Chat weighted/raw share, Chat victim TTFT (mean/p95), Counter Drift (MAE vs actual token usage).
-#    - Hypothesis: Completion correction preserves ~50% long-run fair share regardless of prediction error,
-#      but prediction bias/variance increases interim counter drift and victim TTFT jitter.
+# 2. DRR vs VTC Equivalence & Advanced Scenarios:
+#    - Equivalence: DRR and VTC achieve identical steady-state shares (~50.0% weighted) and within 2% TTFT under overload.
+#    - Hypothesis 2.1 (Windowed Variance vs Quantum): 1-second windowed share variance Var_1s(S) increases
+#      monotonically with base quantum Q in {256, 512, 1024, 2048}, proving Q governs short-term burstiness/granularity.
+#    - Hypothesis 2.2 (On/Off Returning Tenant): An idle tenant returning after 10s of queue silence does not starve
+#      the continuous tenant under either VTC (counter lifted) or DRR (deficit cleared).
+#    - Hypothesis 2.3 (3-Tenant Weighted Sharing): Under weights w = [3.0, 2.0, 1.0], both DRR and VTC converge
+#      to shares 50.0% : 33.3% : 16.7% (+/- 1%).
 #
-# 3. Gateway In-Flight Cap K Sweep:
-#    - K in {4, 16, 64, 256, unbounded}
-#    - Server max batch size B = 16, KV cache = 16384 tokens.
-#    - Hypothesis: When K <= B (K in {4, 16}), requests are held in the fair gateway queue and admitted just-in-time,
-#      yielding minimal victim TTFT. When K > B (K in {64, 256, unbounded}), excess requests sit in the engine's internal
-#      FIFO queue, bypassing fair gateway reordering and degrading victim TTFT towards unmanaged FIFO.
+# 3. Predictor Study Under Heavy-Tailed Outputs:
+#    - Workload: Heavy-tailed log-normal output lengths (Chat med=64, sigma=0.75; RAG med=128, sigma=0.75).
+#    - Metric: Measured continuous counter-error-over-time (time-integrated discrepancy between active interim counter
+#      and ground-truth incremental counter).
+#    - Hypothesis 3.1 (Completion Correction Robustness): With completion correction, long-run share remains ~50.0%
+#      regardless of predictor noise/bias, while short-window (2s) share deviation scales with prediction error.
+#    - Hypothesis 3.2 (Cancelled/Timeout Requests): If 15% of requests abort without completion correction,
+#      underpredicting tenants escape charges, skewing long-run share in their favor.
+#    - Hypothesis 3.3 (Predict-Never-Correct Bound): Without completion correction, prediction bias directly translates
+#      into permanent long-run token share distortion.
 #
-# 4. Capacity Load Sweep (~50%, 80%, 95%, 120% Capacity):
-#    - Policies: FIFO, DRR (Q=512), VTC (incremental)
-#    - Capacity Definition: Nominal load (1.0 = 100%) represents continuous batching saturation where arrival token
-#      rate (Chat: 50 req/s, RAG: 10 req/s = 50,880 raw tok/s) matches sustained token service capacity of engine.
-#    - Load scale scales arrival rates proportionally.
-#    - Caveat: Cross-policy TTFT comparisons reflect both queuing discipline and unequal allocated service shares.
+# 4. Engine In-Flight Cap K Sweep:
+#    - K in {4, 16, 64, 96, 128, 192, 256, unbounded} with B = 16.
+#    - Hypothesis 4.1: K=4 underutilizes the server (only 4 of 16 batch slots active), inflating victim TTFT.
+#    - Hypothesis 4.2: K=16 (K=B) achieves minimum victim TTFT by maximizing engine utilization with zero unmanaged queue.
+#    - Hypothesis 4.3: For K > 16 (64, 96, 128, 192, 256, unbounded), excess requests sit in the engine FIFO queue,
+#      bypassing gateway fair reordering and monotonically degrading victim TTFT.
 #
-# 5. Priority-Band Experiment:
-#    - Tier 0 (High Priority, Chat Premium) vs Tier 1 (Best Effort, RAG Batch)
-#    - Strict inter-tier priority scheduling with intra-tier VTC/DRR fairness.
-#    - Hypothesis: Tier 0 experiences zero head-of-line blocking from Tier 1, achieving minimal TTFT.
+# 5. Priority Bands (Strict Inter-Tier Priority):
+#    - Compared against flat VTC at identical load.
+#    - Preemption semantics: Running requests are NON-PREEMPTIVE (they decode to completion); priority scheduling is
+#      strictly PREEMPTIVE AT ADMISSION (Tier 0 head requests take open batch slots before any Tier 1 request).
+#    - Report Tier 1 unserved request counts and queue accumulation rate at the horizon.
 
-matrix_name: "phase2a_matrix_preregistration"
-version: "1.0.0"
-seeds: [12345, 23456, 34567, 45678, 56789]
-seeds_count: 5
+matrix_name: "phase2a_fix2_matrix_preregistration"
+version: "2.0.0"
+design_status: "pilot-informed"
+seed_start: 200
+seeds_count: 30
 confidence_interval: 0.95
 
 simulation:
@@ -52,67 +63,43 @@ server:
   base_step_time_us: 5000
   per_token_cost_us: 5
 
-drr_quantum_sweep:
-  quantums: [256, 512, 1024, 2048]
-  input_weight: 1.0
-  output_weight: 2.0
-  weighted_run:
-    quantum: 512
-    weights:
-      chat: 2.0
-      rag: 1.0
-
-predictor_study:
-  distribution: "lognormal"
-  chat:
-    median_output: 64
-    sigma: 0.75
-    min_output: 8
-    max_output: 512
-  rag:
-    median_output: 128
-    sigma: 0.75
-    min_output: 16
-    max_output: 1024
-  variants:
-    - name: "oracle"
-      type: "oracle"
-    - name: "mean-prior"
-      type: "mean"
-      prior: 64
-    - name: "noisy-oracle (sigma=0.3, bias=0.0)"
-      type: "noisy-oracle"
-      sigma: 0.3
-      bias: 0.0
-    - name: "noisy-oracle (sigma=0.3, bias=+25%)"
-      type: "noisy-oracle"
-      sigma: 0.3
-      bias: 0.25
-    - name: "noisy-oracle (sigma=0.3, bias=-25%)"
-      type: "noisy-oracle"
-      sigma: 0.3
-      bias: -0.25
-    - name: "noisy-oracle (sigma=0.6, bias=0.0)"
-      type: "noisy-oracle"
-      sigma: 0.6
-      bias: 0.0
-    - name: "noisy-oracle (sigma=0.6, bias=+50%)"
-      type: "noisy-oracle"
-      sigma: 0.6
-      bias: 0.50
-
-gateway_k_sweep:
-  cap_k_values: [4, 16, 64, 256, 10000] # 10000 represents unbounded
+measured_capacity:
+  wtd_tokens_per_sec: 20778.2
+  raw_tokens_per_sec: 17867.5
+  arrival_mix:
+    chat_ratio: 0.8333333333333334 # 5/6
+    rag_ratio:  0.16666666666666666 # 1/6
+    arrival_wtd_share_chat: 0.2312
+    arrival_raw_share_chat: 0.1887
 
 load_sweep:
   loads: [0.50, 0.80, 0.95, 1.20]
   policies: ["fifo", "drr", "vtc"]
 
-priority_band_experiment:
-  tiers:
-    - priority: 0
-      name: "Tier 0 (Interactive Premium)"
-      tenant: "chat"
-    - priority: 1
-      name: "Tier 1 (Batch Best-Effort)"
-      tenant: "rag"
+drr_advanced:
+  quantums: [256, 512, 1024, 2048]
+  window_slice_sec: 1.0
+  three_tenant_weights:
+    tenant_a: 3.0 # target 50.0%
+    tenant_b: 2.0 # target 33.3%
+    tenant_c: 1.0 # target 16.7%
+  returning_tenant:
+    continuous_tenant: "chat"
+    on_off_tenant: "rag"
+    idle_start_sec: 8.0
+    idle_end_sec: 18.0
+
+predictor_study:
+  distribution: "lognormal"
+  chat: { median: 64, sigma: 0.75, min: 8, max: 512 }
+  rag:  { median: 128, sigma: 0.75, min: 16, max: 1024 }
+  cancellation_rate: 0.15
+
+gateway_k_sweep:
+  cap_k_values: [4, 16, 64, 96, 128, 192, 256, 10000]
+
+priority_bands:
+  tier0: "chat"
+  tier1: "rag"
+  preemption_running: false
+  preemption_admission: true
