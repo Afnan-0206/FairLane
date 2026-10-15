@@ -102,6 +102,10 @@ func (p *VTC) Counters() map[string]float64 {
 // - otherActiveTenants: slice of other active/backlogged tenant IDs (excluding tenantID).
 // - lastDepartedTenant: the tenant whose queue most recently transitioned to empty.
 func (p *VTC) applyLift(tenantID string, otherActiveTenants []string, lastDepartedTenant string) {
+	if p.config.LiftMode == LiftModeNone {
+		return
+	}
+
 	currentVal := p.counters[tenantID]
 
 	if len(otherActiveTenants) > 0 {

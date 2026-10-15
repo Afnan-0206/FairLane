@@ -38,6 +38,9 @@ const (
 	// LiftModeArtifact follows the reference implementation (slora/server/router/vtc_req_queue.py):
 	// When Q is empty (len(cnts) == 0), no lift occurs; c_u is unchanged.
 	LiftModeArtifact
+
+	// LiftModeNone disables counter lifting entirely. Counters are never lifted upon arrival.
+	LiftModeNone
 )
 
 func (m LiftMode) String() string {
@@ -46,6 +49,8 @@ func (m LiftMode) String() string {
 		return "paper"
 	case LiftModeArtifact:
 		return "artifact"
+	case LiftModeNone:
+		return "none"
 	default:
 		return "unknown"
 	}

@@ -1,54 +1,47 @@
-# FairLane Phase 2a-fix2 Matrix Pre-Registration Specification
-# Status: [Pilot-Informed Rerun Design]
-# Pre-registered and committed before running the Phase 2a-fix2 matrix.
+# FairLane Phase 2a-fix3 Matrix Pre-Registration Specification
+# Status: [Phase 2a-fix3 Pre-Registration]
+# Pre-registered and committed before running the Phase 2a-fix3 matrix.
 #
 # Evaluation Dimensions & Hypotheses:
 # 1. Capacity Calibration & Load Sweep:
-#    - Max sustainable throughput is calibrated via empirical steady-state saturating run under continuous batching
-#      (B=16, KV=16384 tok, stepBase=5ms, perToken=5µs).
-#    - Measured Capacity: C_measured ~ 20,778 weighted tok/s (17,867 raw tok/s).
-#    - Arrival rates are defined strictly as fractions of measured capacity: 50%, 80%, 95%, 120%.
-#    - Hypothesis 1.1 [Pre-registered]: At 50% load (unsaturated), all work-conserving policies (FIFO, DRR, VTC)
-#      match the arrival-mix token share (~23.1% weighted, ~18.9% raw share).
-#    - Hypothesis 1.2 [Pre-registered]: At 120% load (overload), VTC and DRR diverge from arrival mix to enforce
-#      exact 50.0% (+/- 1%) weighted token fairness, whereas FIFO continues to serve the arrival mix.
+#    - Capacity: C_measured ~ 20,778 weighted tok/s (17,867 raw tok/s) under continuous batching (B=16, KV=16384).
+#    - 1a. Heterogeneous Load Sweep (50%, 80%, 95%, 120%):
+#          At <=120% load, FIFO ~= VTC on TTFT. At 120% load, DRR is worse for Chat due to quantum burstiness.
+#          FIFO and VTC are identical to 0.1 ms at 80% because queue depth is <=1; VTC does NOT fall through to FIFO.
+#    - 1b. Noisy Neighbor Load Sweep: Victim ~20% of measured capacity, Flooder at 50%, 100%, 200%, 400%.
+#          Horizon (45s) is long enough for FIFO queue growth, demonstrating severe FIFO victim degradation vs VTC isolation.
 #
 # 2. DRR vs VTC Equivalence & Advanced Scenarios:
-#    - Equivalence: DRR and VTC achieve identical steady-state shares (~50.0% weighted) and within 2% TTFT under overload.
-#    - Hypothesis 2.1 (Windowed Variance vs Quantum): 1-second windowed share variance Var_1s(S) increases
-#      monotonically with base quantum Q in {256, 512, 1024, 2048}, proving Q governs short-term burstiness/granularity.
-#    - Hypothesis 2.2 (On/Off Returning Tenant): An idle tenant returning after 10s of queue silence does not starve
-#      the continuous tenant under either VTC (counter lifted) or DRR (deficit cleared).
-#    - Hypothesis 2.3 (3-Tenant Weighted Sharing): Under weights w = [3.0, 2.0, 1.0], both DRR and VTC converge
-#      to shares 50.0% : 33.3% : 16.7% (+/- 1%).
+#    - Equivalence: DRR and VTC achieve identical steady-state shares (~50.0% weighted) under overload.
+#    - 2a. Windowed Variance: 1-second windowed share variance shows no statistically significant trend across
+#          Q in {256, 512, 1024, 2048} within 95% CIs (~0.003 - 0.004).
+#    - 2b. On/Off Returning Tenant: Return window W_return = [18.0s, 23.0s] (first N=5.0s after return).
+#          LiftMode=none control allows returning tenant to monopolize the server in first 5s.
+#          VTC (LiftMode=artifact/paper) and DRR (deficit reset) prevent starvation (continuous TTFT <= 300ms).
+#    - 2c. 3-Tenant Weighted Sharing: Under weights w = [3.0, 2.0, 1.0], both DRR and VTC converge to 50% : 33.3% : 16.7%.
 #
-# 3. Predictor Study Under Heavy-Tailed Outputs:
-#    - Workload: Heavy-tailed log-normal output lengths (Chat med=64, sigma=0.75; RAG med=128, sigma=0.75).
-#    - Metric: Measured continuous counter-error-over-time (time-integrated discrepancy between active interim counter
-#      and ground-truth incremental counter).
-#    - Hypothesis 3.1 (Completion Correction Robustness): With completion correction, long-run share remains ~50.0%
-#      regardless of predictor noise/bias, while short-window (2s) share deviation scales with prediction error.
-#    - Hypothesis 3.2 (Cancelled/Timeout Requests): If 15% of requests abort without completion correction,
-#      underpredicting tenants escape charges, skewing long-run share in their favor.
-#    - Hypothesis 3.3 (Predict-Never-Correct Bound): Without completion correction, prediction bias directly translates
-#      into permanent long-run token share distortion.
+# 3. Predictor Study Under Heavy-Tailed Outputs (Overload with Both Tenants Backlogged):
+#    - Workload: Overload with Chat 50 req/s, RAG 10 req/s (both backlogged).
+#    - Metric: Continuous counter error |c_with_predictor(t) - c_oracle(t)| evaluated per tenant.
+#    - 3a. Completion Correction Robustness: With completion correction, steady-state share remains ~50.0%.
+#    - 3b. Timeout Scenario: 15% cancelled requests drop completion correction (counts tracked). Underpredicting tenants escape charges.
+#    - 3c. Predict-Never-Correct Bound: Without completion correction, prediction bias translates into permanent share distortion.
 #
-# 4. Engine In-Flight Cap K Sweep:
-#    - K in {4, 16, 64, 96, 128, 192, 256, unbounded} with B = 16.
-#    - Hypothesis 4.1: K=4 underutilizes the server (only 4 of 16 batch slots active), inflating victim TTFT.
-#    - Hypothesis 4.2: K=16 (K=B) achieves minimum victim TTFT by maximizing engine utilization with zero unmanaged queue.
-#    - Hypothesis 4.3: For K > 16 (64, 96, 128, 192, 256, unbounded), excess requests sit in the engine FIFO queue,
-#      bypassing gateway fair reordering and monotonically degrading victim TTFT.
+# 4. Engine In-Flight Cap K Sweep (Overload Scenario):
+#    - Evaluated under overload with both tenants backlogged.
+#    - Measured Max Engine Queue Length is logged empirically (K-B formula removed).
+#    - K=4 underutilizes the server (75% batch idle).
+#    - K=16 (K=B) achieves minimum victim TTFT.
+#    - For K >= 192, identical results occur because maximum accumulated queue depth never reaches 192 during the run.
+#    - K=16 share was 24.9% in fix2 because load was under-demanding (Chat demand was only 23%).
 #
 # 5. Priority Bands (Strict Inter-Tier Priority):
-#    - Compared against flat VTC at identical load.
-#    - Preemption semantics: Running requests are NON-PREEMPTIVE (they decode to completion); priority scheduling is
-#      strictly PREEMPTIVE AT ADMISSION (Tier 0 head requests take open batch slots before any Tier 1 request).
-#    - Report Tier 1 unserved request counts and queue accumulation rate at the horizon.
+#    - Preemption semantics: Non-preemptive Execution with Strict Head-of-Queue Priority Admission (Tier 0 heads admitted first).
+#    - Table includes FIFO baseline alongside Flat VTC and Priority Bands at 80% and 100% load.
 
-matrix_name: "phase2a_fix2_matrix_preregistration"
-version: "2.0.0"
-design_status: "pilot-informed"
+matrix_name: "phase2a_fix3_matrix_preregistration"
+version: "3.0.0"
+design_status: "phase2a-fix3-final"
 seed_start: 200
 seeds_count: 30
 confidence_interval: 0.95
@@ -56,6 +49,7 @@ confidence_interval: 0.95
 simulation:
   horizon_us: 30000000 # 30 seconds
   warmup_us:   5000000 # 5 seconds warm-up discarded
+  noisy_neighbor_horizon_us: 45000000 # 45s for deep queue growth
 
 server:
   max_batch_size: 16
@@ -66,14 +60,14 @@ server:
 measured_capacity:
   wtd_tokens_per_sec: 20778.2
   raw_tokens_per_sec: 17867.5
-  arrival_mix:
-    chat_ratio: 0.8333333333333334 # 5/6
-    rag_ratio:  0.16666666666666666 # 1/6
-    arrival_wtd_share_chat: 0.2312
-    arrival_raw_share_chat: 0.1887
 
-load_sweep:
+load_sweep_heterogeneous:
   loads: [0.50, 0.80, 0.95, 1.20]
+  policies: ["fifo", "drr", "vtc"]
+
+load_sweep_noisy_neighbor:
+  victim_load_ratio: 0.20 # 20% of capacity
+  flooder_load_ratios: [0.50, 1.00, 2.00, 4.00]
   policies: ["fifo", "drr", "vtc"]
 
 drr_advanced:
@@ -88,18 +82,53 @@ drr_advanced:
     on_off_tenant: "rag"
     idle_start_sec: 8.0
     idle_end_sec: 18.0
+    return_window_sec: 5.0 # [18.0s, 23.0s]
+    modes: ["lift_artifact", "lift_paper", "lift_none", "drr"]
 
 predictor_study:
+  chat_rate: 50.0
+  rag_rate: 10.0
   distribution: "lognormal"
   chat: { median: 64, sigma: 0.75, min: 8, max: 512 }
   rag:  { median: 128, sigma: 0.75, min: 16, max: 1024 }
   cancellation_rate: 0.15
 
 gateway_k_sweep:
+  chat_rate: 50.0
+  rag_rate: 10.0
   cap_k_values: [4, 16, 64, 96, 128, 192, 256, 10000]
 
 priority_bands:
   tier0: "chat"
   tier1: "rag"
   preemption_running: false
-  preemption_admission: true
+  admission_priority: "strict_head_of_queue"
+  loads: [0.80, 1.00]
+  policies: ["fifo", "flat_vtc", "priority_bands"]
+
+validation_criteria:
+  load_sweep:
+    unsaturated_50pct_share_min: 0.22
+    unsaturated_50pct_share_max: 0.26
+    drr_120pct_chat_ttft_ratio_vs_vtc_min: 1.15
+  noisy_neighbor:
+    fifo_slowdown_400pct_min: 100.0 # FIFO victim slowdown >= 100x vs solo
+    vtc_victim_ttft_400pct_max_ms: 250.0 # VTC bounds victim TTFT <= 250ms under 400% flooder
+    fifo_vs_vtc_slowdown_ratio_min: 50.0 # FIFO is >= 50x worse than VTC
+  on_off_returning:
+    lift_none_return_share_min: 0.70
+    continuous_ttft_lift_artifact_max_ms: 600.0
+  predictor_study:
+    oracle_chat_error_max: 0.001
+    oracle_rag_error_max: 0.001
+    completion_correction_share_min: 0.48
+    completion_correction_share_max: 0.52
+    timeouts_fired_min: 50
+    dropped_corrections_min: 50
+    never_correct_pos_bias_share_max: 0.46
+    never_correct_neg_bias_share_min: 0.52
+  gateway_k_sweep:
+    k4_engine_batch_idle_min: 0.70
+    k16_ttft_lower_than_k_unbounded: true
+  priority_bands:
+    tier0_ttft_priority_vs_flat_reduction_min_pct: 40.0

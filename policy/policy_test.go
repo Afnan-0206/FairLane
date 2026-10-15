@@ -366,3 +366,33 @@ func TestRoundRobinAdvanceOnPickVsOnDispatch(t *testing.T) {
 	}
 }
 
+func TestVTCLiftModeNone(t *testing.T) {
+	// 1. LiftModeArtifact: counter IS lifted to min of other active tenants
+	cfgArt := policy.DefaultVTCConfig()
+	cfgArt.LiftMode = policy.LiftModeArtifact
+	vtcArt := policy.NewVTC(cfgArt)
+
+	// Tenant A accumulates 5000 tokens
+	vtcArt.OnDispatch(&mockRequest{id: "a1", tenantID: "tenant-a", input: 5000})
+
+	// Tenant B arrives while Tenant A is backlogged
+	reqB := &mockRequest{id: "b1", tenantID: "tenant-b", input: 100}
+	vtcArt.OnArrival(reqB, true, "", []string{"tenant-a"})
+
+	if vtcArt.Counter("tenant-b") != 5000 {
+		t.Fatalf("Expected tenant-b counter lifted to 5000 under LiftModeArtifact, got %.1f", vtcArt.Counter("tenant-b"))
+	}
+
+	// 2. LiftModeNone: counter is NEVER lifted
+	cfgNone := policy.DefaultVTCConfig()
+	cfgNone.LiftMode = policy.LiftModeNone
+	vtcNone := policy.NewVTC(cfgNone)
+
+	vtcNone.OnDispatch(&mockRequest{id: "a1", tenantID: "tenant-a", input: 5000})
+	vtcNone.OnArrival(reqB, true, "", []string{"tenant-a"})
+
+	if vtcNone.Counter("tenant-b") != 0 {
+		t.Fatalf("Expected tenant-b counter to remain 0 under LiftModeNone, got %.1f", vtcNone.Counter("tenant-b"))
+	}
+}
+

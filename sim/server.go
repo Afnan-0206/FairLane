@@ -29,6 +29,10 @@ type RunningRequest struct {
 	tokensInKV  int  // inputTokens + generatedCount
 }
 
+func (r *RunningRequest) Request() *Request {
+	return r.req
+}
+
 // Server simulates an LLM inference engine with continuous batching.
 type Server struct {
 	cfg        ServerConfig
@@ -45,6 +49,10 @@ func NewServer(cfg ServerConfig) *Server {
 
 func (s *Server) RunningCount() int {
 	return len(s.running)
+}
+
+func (s *Server) RunningRequests() []*RunningRequest {
+	return s.running
 }
 
 func (s *Server) UsedKVTokens() int {

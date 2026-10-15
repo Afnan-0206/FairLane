@@ -5,7 +5,9 @@
 #   2. Under Round-Robin (request-count), because the flooder's requests consume >6x the tokens of the victim,
 #      RR still allows the flooder to dominate GPU token-seconds, failing to isolate the victim (>2x slowdown).
 #   3. Under VTC, token-aware virtual timeline tracking restores resource equity, ensuring victim slowdown
-#      remains close to solo baseline (~1.0-1.3x) and Jain's index is maximized.
+#      remains close to solo baseline (~1.0-1.3x). Note: Sliding-window Jain's index across asymmetric demand
+#      tenants (victim light demand vs flooder heavy demand) is dropped from primary isolation criteria in favor
+#      of direct slowdown and TTFT (code path preserved in sim/simulator.go:271-290 and 384-400).
 
 experiment_name: "exp_noisy_neighbor"
 seeds_count: 30

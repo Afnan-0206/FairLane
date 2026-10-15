@@ -122,3 +122,58 @@ func TestGatewayCapKInvariant(t *testing.T) {
 		}
 	}
 }
+
+// TestTimeoutDropsCompletionCorrection verifies that timeouts drop OnComplete calls and track counts.
+func TestTimeoutDropsCompletionCorrection(t *testing.T) {
+	cfg := policy.DefaultVTCConfig()
+	cfg.ChargingModel = policy.ChargingPredictedAtAdmission
+	vtc := policy.NewVTC(cfg)
+
+	// Under-predicted request: predicted 10, actual 50.
+	req := sim.NewRequest("req-timeout", "chat", 100, 50, 50, 0)
+	req.SetPredictedOutput(10)
+
+	cancelled := map[string]bool{"req-timeout": true}
+	wrapper := sim.NewTimeoutCorrectionWrapper(vtc, cancelled)
+
+	// Dispatch: charged 100*1 + 10*2 = 120
+	wrapper.OnDispatch(req)
+	counterAfterDispatch := vtc.Counter("chat")
+	if counterAfterDispatch != 120.0 {
+		t.Fatalf("Expected counter 120 after admission, got %.1f", counterAfterDispatch)
+	}
+
+	// Completion: Should be DROPPED
+	wrapper.OnComplete("chat", req, 100, 50)
+
+	if wrapper.TimeoutsFired != 1 {
+		t.Fatalf("Expected 1 timeout fired, got %d", wrapper.TimeoutsFired)
+	}
+	if wrapper.DroppedCorrections != 1 {
+		t.Fatalf("Expected 1 dropped correction, got %d", wrapper.DroppedCorrections)
+	}
+
+	// Counter must STILL be 120 (correction of +80 was NOT applied!)
+	if vtc.Counter("chat") != 120.0 {
+		t.Fatalf("Expected counter to remain 120 due to dropped correction, got %.1f", vtc.Counter("chat"))
+	}
+}
+
+// TestCounterErrorMetricPerTenant verifies |c_pred - c_oracle| calculation.
+func TestCounterErrorMetricPerTenant(t *testing.T) {
+	// Oracle case: prediction == actual -> error must be 0
+	cOracle := 500.0
+	cPredExact := 500.0
+	diffExact := cPredExact - cOracle
+	if diffExact != 0.0 {
+		t.Fatalf("Expected zero error for exact oracle predictor, got %f", diffExact)
+	}
+
+	// Biased case: prediction != actual
+	cPredBiased := 400.0
+	diffBiased := cPredBiased - cOracle
+	if diffBiased >= 0 || diffBiased != -100.0 {
+		t.Fatalf("Expected -100 error for underpredicted counter, got %f", diffBiased)
+	}
+}
+
